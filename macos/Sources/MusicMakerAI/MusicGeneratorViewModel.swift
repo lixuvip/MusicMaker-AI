@@ -5,6 +5,23 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class MusicGeneratorViewModel: NSObject, ObservableObject {
+    enum FFmpegStatus: Equatable {
+        case available(path: String)
+        case unavailable
+        case installing
+
+        var title: String {
+            switch self {
+            case .available:
+                return "已安装"
+            case .unavailable:
+                return "未安装"
+            case .installing:
+                return "安装中"
+            }
+        }
+    }
+
     @Published var baseURL: String {
         didSet { UserDefaults.standard.set(baseURL, forKey: Defaults.baseURL) }
     }
@@ -32,6 +49,9 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var bitrate: Int {
         didSet { UserDefaults.standard.set(bitrate, forKey: Defaults.bitrate) }
     }
+    @Published var generationCount: Int {
+        didSet { UserDefaults.standard.set(generationCount, forKey: Defaults.generationCount) }
+    }
 
     @Published var lyricsOptimizer: Bool {
         didSet { UserDefaults.standard.set(lyricsOptimizer, forKey: Defaults.lyricsOptimizer) }
@@ -56,6 +76,10 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var prompt: String
     @Published var lyrics: String
     @Published var referenceAudioURL: String
+    @Published var categoryLibrary: [String] = []
+    @Published var generationCategory: String {
+        didSet { UserDefaults.standard.set(generationCategory, forKey: Defaults.generationCategory) }
+    }
     @Published var isGenerating = false
     @Published var statusText = "准备就绪"
     @Published var errorMessage = ""
@@ -64,8 +88,13 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var lastRemoteURL: URL?
     @Published var lastSeed: Int?
     @Published var isPlaying = false
+    @Published var currentPlaybackURL: URL?
+    @Published var playbackPosition: Double = 0
+    @Published var playbackDuration: Double = 0
     @Published var history: [GenerationHistoryItem] = []
     @Published var selectedHistoryID: GenerationHistoryItem.ID?
+    @Published var historyFavoritesOnly = false
+    @Published var historyTagFilter = ""
     @Published var transcodeBitrateKbps: Int {
         didSet { UserDefaults.standard.set(transcodeBitrateKbps, forKey: Defaults.transcodeBitrateKbps) }
     }
@@ -77,20 +106,33 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var autoTranscodeAfterGeneration: Bool {
         didSet { UserDefaults.standard.set(autoTranscodeAfterGeneration, forKey: Defaults.autoTranscodeAfterGeneration) }
     }
+    @Published var autoPlayAfterGeneration: Bool {
+        didSet { UserDefaults.standard.set(autoPlayAfterGeneration, forKey: Defaults.autoPlayAfterGeneration) }
+    }
+    @Published var ffmpegStatus: FFmpegStatus = .unavailable
     @Published var isTranscoding = false
+    @Published var batchProgressTotal = 0
+    @Published var batchProgressCompleted = 0
+    @Published var batchProgressCurrentIndex = 0
 
     private var player: AVAudioPlayer?
+    private var playbackTimer: Timer?
 
     var canGenerate: Bool {
         !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !needsLyrics &&
-        !isGenerating
+        !isGenerating &&
+        (1...10).contains(generationCount)
     }
 
     var needsLyrics: Bool {
         !instrumental && lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var isBatchGeneration: Bool {
+        generationCount > 1
     }
 
     override init() {
@@ -102,9 +144,11 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         audioFormat = AudioFormat(rawValue: defaults.string(forKey: Defaults.audioFormat) ?? "") ?? .mp3
         sampleRate = defaults.object(forKey: Defaults.sampleRate) as? Int ?? 44100
         bitrate = defaults.object(forKey: Defaults.bitrate) as? Int ?? 256000
+        generationCount = defaults.object(forKey: Defaults.generationCount) as? Int ?? 1
         transcodeBitrateKbps = defaults.object(forKey: Defaults.transcodeBitrateKbps) as? Int ?? 320
         transcodeSampleRate = defaults.object(forKey: Defaults.transcodeSampleRate) as? Int ?? 44100
         autoTranscodeAfterGeneration = defaults.object(forKey: Defaults.autoTranscodeAfterGeneration) as? Bool ?? false
+        autoPlayAfterGeneration = defaults.object(forKey: Defaults.autoPlayAfterGeneration) as? Bool ?? false
         lyricsOptimizer = defaults.object(forKey: Defaults.lyricsOptimizer) as? Bool ?? true
         instrumental = defaults.object(forKey: Defaults.instrumental) as? Bool ?? false
         aigcWatermark = defaults.object(forKey: Defaults.aigcWatermark) as? Bool ?? false
@@ -113,9 +157,13 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         prompt = defaults.string(forKey: Defaults.prompt) ?? "流行电子，明亮但有电影感，副歌强记忆点，适合 90 秒宣传片。"
         lyrics = defaults.string(forKey: Defaults.lyrics) ?? ""
         referenceAudioURL = defaults.string(forKey: Defaults.referenceAudioURL) ?? ""
+        categoryLibrary = defaults.stringArray(forKey: Defaults.categoryLibrary) ?? []
+        generationCategory = defaults.string(forKey: Defaults.generationCategory) ?? ""
         super.init()
         history = GenerationHistoryStore.load(from: Self.historyURL)
         transcodeQueue = TranscodeQueueStore.load(from: Self.transcodeQueueURL)
+        rebuildCategoryLibraryIfNeeded()
+        refreshFFmpegStatus()
     }
 
     func generate() async {
@@ -141,50 +189,84 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         }
 
         isGenerating = true
-        statusText = "正在提交到 MiniMax... Seed: \(seed)"
         lastRemoteURL = nil
         lastSeed = seed
         stopPlayback()
 
-        do {
-            let client = MinimaxMusicClient(baseURL: baseURL, apiKey: apiKey)
-            let result = try await client.generateMusic(
-                request: MusicGenerationRequest(
-                    model: model.rawValue,
-                    prompt: normalizedPrompt,
-                    lyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt),
-                    outputFormat: outputMode.rawValue,
-                    audioSetting: AudioSetting(
-                        sampleRate: sampleRate,
-                        bitrate: bitrate,
-                        format: audioFormat.rawValue
-                    ),
-                    lyricsOptimizer: lyricsOptimizer,
-                    aigcWatermark: aigcWatermark,
-                    instrumental: instrumental,
-                    audioURL: model == .cover ? nonEmpty(referenceAudioURL) : nil,
-                    seed: seed
-                )
-            )
+        let totalCount = generationCount
+        var completedCount = 0
+        batchProgressTotal = totalCount
+        batchProgressCompleted = 0
+        batchProgressCurrentIndex = 0
+        let client = MinimaxMusicClient(baseURL: baseURL, apiKey: apiKey)
 
-            statusText = "正在保存音频..."
-            let savedURL = try await saveAudio(from: result)
-            lastFileURL = savedURL
-            lastRemoteURL = result.remoteURL
-            appendHistory(fileURL: savedURL, remoteURL: result.remoteURL, seed: seed, submittedPrompt: normalizedPrompt, submittedLyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt))
-            let transcodeID = enqueueLatestOutputForTranscoding(fileURL: savedURL)
-            statusText = "生成完成，Seed: \(seed)"
-            try preparePlayback(url: savedURL)
-            if autoTranscodeAfterGeneration, let transcodeID {
-                await runTranscode(for: transcodeID)
+        do {
+            for index in 0..<totalCount {
+                batchProgressCurrentIndex = index + 1
+                let currentSeed = index == 0 ? seed : Int.random(in: 0...1_000_000)
+                lastSeed = currentSeed
+                statusText = totalCount == 1
+                    ? "正在提交到 MiniMax... Seed: \(currentSeed)"
+                    : "正在生成第 \(index + 1) / \(totalCount) 首... Seed: \(currentSeed)"
+
+                let result = try await client.generateMusic(
+                    request: MusicGenerationRequest(
+                        model: model.rawValue,
+                        prompt: normalizedPrompt,
+                        lyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt),
+                        outputFormat: outputMode.rawValue,
+                        audioSetting: AudioSetting(
+                            sampleRate: sampleRate,
+                            bitrate: bitrate,
+                            format: audioFormat.rawValue
+                        ),
+                        lyricsOptimizer: lyricsOptimizer,
+                        aigcWatermark: aigcWatermark,
+                        instrumental: instrumental,
+                        audioURL: model == .cover ? nonEmpty(referenceAudioURL) : nil,
+                        seed: currentSeed
+                    )
+                )
+
+                statusText = totalCount == 1 ? "正在保存音频..." : "正在保存第 \(index + 1) 首音频..."
+                let savedURL = try await saveAudio(from: result)
+                lastFileURL = savedURL
+                lastRemoteURL = result.remoteURL
+                appendHistory(
+                    fileURL: savedURL,
+                    remoteURL: result.remoteURL,
+                    seed: currentSeed,
+                    submittedPrompt: normalizedPrompt,
+                    submittedLyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt),
+                    category: generationCategory
+                )
+                let transcodeID = enqueueLatestOutputForTranscoding(fileURL: savedURL)
+                completedCount += 1
+                batchProgressCompleted = completedCount
+
+                if autoPlayAfterGeneration && totalCount == 1 {
+                    try preparePlayback(url: savedURL)
+                } else {
+                    currentPlaybackURL = savedURL
+                    playbackPosition = 0
+                    playbackDuration = 0
+                }
+                if autoTranscodeAfterGeneration, let transcodeID {
+                    await runTranscode(for: transcodeID)
+                }
             }
+
+            statusText = totalCount == 1 ? "生成完成，Seed: \(seed)" : "批量生成完成，共 \(completedCount) 首"
         } catch {
             errorMessage = error.localizedDescription
             showError = true
-            statusText = "生成失败"
+            statusText = completedCount > 0
+                ? "批量生成中断，已完成 \(completedCount) / \(totalCount) 首"
+                : "生成失败"
         }
 
         isGenerating = false
+        batchProgressCurrentIndex = 0
     }
 
     func togglePlayback() {
@@ -196,6 +278,40 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
             player.play()
             isPlaying = true
         }
+    }
+
+    func playFile(url: URL) {
+        do {
+            stopPlayback()
+            try preparePlayback(url: url)
+            currentPlaybackURL = url
+            statusText = "正在播放：\(url.lastPathComponent)"
+        } catch {
+            errorMessage = "播放失败：\(error.localizedDescription)"
+            showError = true
+        }
+    }
+
+    func seekPlayback(to progress: Double) {
+        guard let player, playbackDuration > 0 else { return }
+        let clamped = min(max(progress, 0), playbackDuration)
+        player.currentTime = clamped
+        playbackPosition = clamped
+    }
+
+    func acceptDroppedAudioFiles(_ providers: [NSItemProvider]) -> Bool {
+        let supportedType = UTType.fileURL.identifier
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(supportedType) {
+            provider.loadItem(forTypeIdentifier: supportedType, options: nil) { item, _ in
+                guard let data = item as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                Task { @MainActor in
+                    self.playFile(url: url)
+                }
+            }
+            return true
+        }
+        return false
     }
 
     func openOutputFolder() {
@@ -233,7 +349,6 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         lastFileURL = item.fileURL
         lastRemoteURL = item.remoteURL.flatMap(URL.init(string:))
         lastSeed = item.seed
-        stopPlayback()
         statusText = "已选择历史记录，Seed: \(item.seed)"
     }
 
@@ -267,6 +382,47 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         }
     }
 
+    func toggleFavorite(for id: GenerationHistoryItem.ID) {
+        guard let index = history.firstIndex(where: { $0.id == id }) else { return }
+        history[index].isFavorite.toggle()
+        persistHistory()
+    }
+
+    func updateCategory(for id: GenerationHistoryItem.ID, category: String) {
+        guard let index = history.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        history[index].favoriteTag = trimmed.isEmpty ? nil : trimmed
+        if !trimmed.isEmpty {
+            addCategoryToLibrary(trimmed)
+        }
+        persistHistory()
+    }
+
+    func addGenerationCategoryToLibrary() {
+        let trimmed = generationCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        generationCategory = trimmed
+        addCategoryToLibrary(trimmed)
+    }
+
+    func selectGenerationCategory(_ category: String) {
+        generationCategory = category
+    }
+
+    var filteredHistory: [GenerationHistoryItem] {
+        history.filter { item in
+            let favoriteMatch = !historyFavoritesOnly || item.isFavorite
+            let trimmedFilter = historyTagFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            let tagMatch: Bool
+            if trimmedFilter.isEmpty {
+                tagMatch = true
+            } else {
+                tagMatch = item.categoryText.lowercased().contains(trimmedFilter.lowercased())
+            }
+            return favoriteMatch && tagMatch
+        }
+    }
+
     func runSelectedTranscode() async {
         guard let selectedTranscodeID else { return }
         await runTranscode(for: selectedTranscodeID)
@@ -275,6 +431,12 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     func runTranscode(for id: TranscodeQueueItem.ID) async {
         guard !isTranscoding else { return }
         guard let index = transcodeQueue.firstIndex(where: { $0.id == id }) else { return }
+        guard case .available = ffmpegStatus else {
+            errorMessage = "尚未检测到 ffmpeg。请先在转码页面点击“开始安装”，或手动安装后刷新状态。"
+            showError = true
+            statusText = "缺少 ffmpeg"
+            return
+        }
 
         isTranscoding = true
         transcodeQueue[index].status = .processing
@@ -377,18 +539,81 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         persistTranscodeQueue(bestEffortStatusText: nil)
     }
 
+    func refreshFFmpegStatus() {
+        if let path = Self.detectFFmpegPath() {
+            ffmpegStatus = .available(path: path)
+        } else {
+            ffmpegStatus = .unavailable
+        }
+    }
+
+    func installFFmpeg() async {
+        guard ffmpegStatus != .installing else { return }
+        guard let brewPath = Self.detectHomebrewPath() else {
+            errorMessage = "未检测到 Homebrew。请先安装 Homebrew，再点击“开始安装”。"
+            showError = true
+            statusText = "缺少 Homebrew"
+            return
+        }
+
+        ffmpegStatus = .installing
+        statusText = "正在安装 ffmpeg..."
+
+        do {
+            try await Self.runCommand(
+                executablePath: brewPath,
+                arguments: ["install", "ffmpeg"]
+            )
+            refreshFFmpegStatus()
+            if case .available = ffmpegStatus {
+                statusText = "ffmpeg 安装完成"
+            } else {
+                statusText = "安装完成，请刷新检测"
+            }
+        } catch {
+            ffmpegStatus = .unavailable
+            errorMessage = error.localizedDescription
+            showError = true
+            statusText = "ffmpeg 安装失败"
+        }
+    }
+
     private func preparePlayback(url: URL) throws {
         player = try AVAudioPlayer(contentsOf: url)
         player?.delegate = self
         player?.prepareToPlay()
         player?.play()
+        currentPlaybackURL = url
+        playbackDuration = player?.duration ?? 0
+        playbackPosition = player?.currentTime ?? 0
         isPlaying = true
+        startPlaybackTimer()
     }
 
     private func stopPlayback() {
         player?.stop()
         player = nil
         isPlaying = false
+        currentPlaybackURL = nil
+        playbackPosition = 0
+        playbackDuration = 0
+        stopPlaybackTimer()
+    }
+
+    private func startPlaybackTimer() {
+        stopPlaybackTimer()
+        playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, let player = self.player else { return }
+                self.playbackPosition = player.currentTime
+                self.playbackDuration = player.duration
+            }
+        }
+    }
+
+    private func stopPlaybackTimer() {
+        playbackTimer?.invalidate()
+        playbackTimer = nil
     }
 
     @discardableResult
@@ -440,7 +665,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         return fileURL
     }
 
-    private func appendHistory(fileURL: URL, remoteURL: URL?, seed: Int, submittedPrompt: String, submittedLyrics: String) {
+    private func appendHistory(fileURL: URL, remoteURL: URL?, seed: Int, submittedPrompt: String, submittedLyrics: String, category: String) {
         let item = GenerationHistoryItem(
             id: UUID(),
             createdAt: Date(),
@@ -459,11 +684,38 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
             seed: seed,
             directoryPath: fileURL.deletingLastPathComponent().path,
             filePath: fileURL.path,
-            remoteURL: remoteURL?.absoluteString
+            remoteURL: remoteURL?.absoluteString,
+            isFavorite: false,
+            favoriteTag: category.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : category.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         history.insert(item, at: 0)
         selectedHistoryID = item.id
+        if let savedCategory = item.favoriteTag, !savedCategory.isEmpty {
+            addCategoryToLibrary(savedCategory)
+        }
 
+        persistHistory()
+    }
+
+    private func addCategoryToLibrary(_ category: String) {
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if !categoryLibrary.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            categoryLibrary.append(trimmed)
+            categoryLibrary.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            UserDefaults.standard.set(categoryLibrary, forKey: Defaults.categoryLibrary)
+        }
+    }
+
+    private func rebuildCategoryLibraryIfNeeded() {
+        for item in history {
+            if !item.categoryText.isEmpty {
+                addCategoryToLibrary(item.categoryText)
+            }
+        }
+    }
+
+    private func persistHistory() {
         do {
             try GenerationHistoryStore.save(history, to: Self.historyURL)
         } catch {
@@ -533,10 +785,81 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     }
 
     private static func runFFmpeg(arguments: [String]) async throws {
+        guard let ffmpegPath = detectFFmpegPath() else {
+            throw MinimaxMusicError.requestFailed("未检测到可用的 ffmpeg。")
+        }
+        try await runCommand(executablePath: ffmpegPath, arguments: arguments)
+    }
+
+    private static func makeTranscodedFilename(from sourceURL: URL, bitrateKbps: Int, sampleRate: Int) -> String {
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let ext = preferredTranscodeExtension(for: sourceURL)
+        let khzText = String(format: "%.1f", Double(sampleRate) / 1000.0)
+        return "\(baseName)-\(bitrateKbps)kbps-\(khzText)kHz.\(ext)"
+    }
+
+    private static func preferredTranscodeExtension(for sourceURL: URL) -> String {
+        let ext = sourceURL.pathExtension.lowercased()
+        return ext.isEmpty ? "mp3" : ext
+    }
+
+    private static func detectFFmpegPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg"
+        ]
+
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["ffmpeg"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let path = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return path?.isEmpty == false ? path : nil
+        } catch {
+            return nil
+        }
+    }
+
+    private static func detectHomebrewPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew"
+        ]
+
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+
+        return nil
+    }
+
+    private static func runCommand(executablePath: String, arguments: [String]) async throws {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+            process.executableURL = URL(fileURLWithPath: executablePath)
             process.arguments = arguments
+
+            var environment = ProcessInfo.processInfo.environment
+            environment["PATH"] = [
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            ].joined(separator: ":")
+            process.environment = environment
 
             let errorPipe = Pipe()
             process.standardError = errorPipe
@@ -550,28 +873,16 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
                 if process.terminationStatus == 0 {
                     continuation.resume()
                 } else {
-                    continuation.resume(throwing: MinimaxMusicError.requestFailed(errorOutput ?? "ffmpeg 转码失败"))
+                    continuation.resume(throwing: MinimaxMusicError.requestFailed(errorOutput ?? "命令执行失败"))
                 }
             }
 
             do {
                 try process.run()
             } catch {
-                continuation.resume(throwing: MinimaxMusicError.requestFailed("无法启动 ffmpeg：\(error.localizedDescription)"))
+                continuation.resume(throwing: MinimaxMusicError.requestFailed("无法启动命令：\(error.localizedDescription)"))
             }
         }
-    }
-
-    private static func makeTranscodedFilename(from sourceURL: URL, bitrateKbps: Int, sampleRate: Int) -> String {
-        let baseName = sourceURL.deletingPathExtension().lastPathComponent
-        let ext = preferredTranscodeExtension(for: sourceURL)
-        let khzText = String(format: "%.1f", Double(sampleRate) / 1000.0)
-        return "\(baseName)-\(bitrateKbps)kbps-\(khzText)kHz.\(ext)"
-    }
-
-    private static func preferredTranscodeExtension(for sourceURL: URL) -> String {
-        let ext = sourceURL.pathExtension.lowercased()
-        return ext.isEmpty ? "mp3" : ext
     }
 
     nonisolated private static func validateHTTP(response: URLResponse, data: Data) throws {
@@ -620,6 +931,8 @@ extension MusicGeneratorViewModel: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
             isPlaying = false
+            playbackPosition = 0
+            stopPlaybackTimer()
         }
     }
 }
@@ -632,9 +945,13 @@ private enum Defaults {
     static let audioFormat = "audioFormat"
     static let sampleRate = "sampleRate"
     static let bitrate = "bitrate"
+    static let generationCount = "generationCount"
     static let transcodeBitrateKbps = "transcodeBitrateKbps"
     static let transcodeSampleRate = "transcodeSampleRate"
     static let autoTranscodeAfterGeneration = "autoTranscodeAfterGeneration"
+    static let autoPlayAfterGeneration = "autoPlayAfterGeneration"
+    static let generationCategory = "generationCategory"
+    static let categoryLibrary = "categoryLibrary"
     static let lyricsOptimizer = "lyricsOptimizer"
     static let instrumental = "instrumental"
     static let aigcWatermark = "aigcWatermark"

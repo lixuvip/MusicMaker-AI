@@ -19,6 +19,8 @@ struct GenerationHistoryItem: Codable, Identifiable, Hashable {
     let directoryPath: String
     let filePath: String
     let remoteURL: String?
+    var isFavorite: Bool
+    var favoriteTag: String?
 
     var fileURL: URL {
         URL(fileURLWithPath: filePath)
@@ -30,6 +32,11 @@ struct GenerationHistoryItem: Codable, Identifiable, Hashable {
 
     var title: String {
         prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "未命名生成" : prompt
+    }
+
+    var categoryText: String {
+        let trimmed = favoriteTag?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed
     }
 
     var createdAtText: String {

@@ -7,18 +7,24 @@ struct ContentView: View {
     @State private var selectedModule: ToolModule? = .musicGeneration
 
     var body: some View {
-        NavigationSplitView {
-            ModuleSidebar(selectedModule: $selectedModule)
-                .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
-        } detail: {
-            Group {
-                switch selectedModule ?? .musicGeneration {
-                case .musicGeneration:
-                    MusicGenerationModule()
-                case .audioTranscoding:
-                    AudioTranscodingModule()
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                ModuleSidebar(selectedModule: $selectedModule)
+                    .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
+            } detail: {
+                Group {
+                    switch selectedModule ?? .musicGeneration {
+                    case .musicGeneration:
+                        MusicGenerationModule()
+                    case .audioTranscoding:
+                        AudioTranscodingModule()
+                    case .history:
+                        HistoryModule()
+                    }
                 }
             }
+            Divider()
+            GlobalPlayerBar()
         }
         .alert("生成失败", isPresented: $viewModel.showError) {
             Button("好", role: .cancel) {}
@@ -31,6 +37,7 @@ struct ContentView: View {
 enum ToolModule: String, CaseIterable, Identifiable {
     case musicGeneration
     case audioTranscoding
+    case history
 
     var id: String { rawValue }
 
@@ -40,6 +47,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
             return "音乐生成"
         case .audioTranscoding:
             return "音频转码"
+        case .history:
+            return "历史记录"
         }
     }
 
@@ -49,6 +58,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
             return "MiniMax /v1/music_generation"
         case .audioTranscoding:
             return "本地 ffmpeg 转码队列"
+        case .history:
+            return "生成参数与文件记录"
         }
     }
 
@@ -58,6 +69,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
             return "music.quarternote.3"
         case .audioTranscoding:
             return "waveform.badge.magnifyingglass"
+        case .history:
+            return "clock.arrow.circlepath"
         }
     }
 }
@@ -115,6 +128,27 @@ struct AudioTranscodingModule: View {
             .padding(28)
         }
         .navigationTitle("音频转码")
+    }
+}
+
+struct HistoryModule: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("历史记录")
+                        .font(.largeTitle.weight(.semibold))
+                    Text("查看历史生成参数、音频文件路径、Seed 与提交内容，方便回溯和复用。")
+                        .foregroundStyle(.secondary)
+                }
+
+                HistoryPanel()
+
+                Spacer(minLength: 0)
+            }
+            .padding(28)
+        }
+        .navigationTitle("历史记录")
     }
 }
 
@@ -176,6 +210,13 @@ struct SettingsPanel: View {
                     Text("256 kbps").tag(256000)
                 }
                 .pickerStyle(.segmented)
+
+                Picker("生成数量", selection: $viewModel.generationCount) {
+                    ForEach(1...10, id: \.self) { count in
+                        Text("\(count) 首").tag(count)
+                    }
+                }
+                .pickerStyle(.menu)
             }
 
             Section("选项") {
@@ -255,13 +296,53 @@ struct GeneratorPanel: View {
                     }
                 }
 
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("本次分类", systemImage: "tag")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        Picker("分类列表", selection: Binding(
+                            get: { viewModel.generationCategory },
+                            set: { viewModel.selectGenerationCategory($0) }
+                        )) {
+                            Text("未选择").tag("")
+                            ForEach(viewModel.categoryLibrary, id: \.self) { category in
+                                Text(category).tag(category)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        TextField("输入新分类", text: $viewModel.generationCategory)
+                            .textFieldStyle(.roundedBorder)
+
+                        Button("加入分类库") {
+                            viewModel.addGenerationCategoryToLibrary()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(viewModel.generationCategory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    Text("这里填写的分类会自动写入本次生成的所有历史记录，批量生成时每首都会继承。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 PlayerToolbar()
+
+                Toggle("生成完成后自动播放", isOn: $viewModel.autoPlayAfterGeneration)
+                    .disabled(viewModel.generationCount > 1)
+
+                if viewModel.generationCount > 1 {
+                    Text("批量生成时不支持“生成后自动播放”，以避免播放状态和批量任务互相干扰。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if viewModel.isGenerating && viewModel.batchProgressTotal > 1 {
+                    BatchProgressPanel()
+                }
 
                 if let fileURL = viewModel.lastFileURL {
                     ResultRow(fileURL: fileURL, remoteURL: viewModel.lastRemoteURL, seed: viewModel.lastSeed)
                 }
-
-                HistoryPanel()
 
                 Spacer(minLength: 0)
             }
@@ -354,12 +435,47 @@ struct ResultRow: View {
     }
 }
 
+struct BatchProgressPanel: View {
+    @EnvironmentObject private var viewModel: MusicGeneratorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("批量生成进度", systemImage: "square.stack.3d.up.fill")
+                    .font(.headline)
+                Spacer()
+                Text("\(viewModel.batchProgressCompleted) / \(viewModel.batchProgressTotal)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(
+                value: Double(viewModel.batchProgressCompleted),
+                total: Double(max(viewModel.batchProgressTotal, 1))
+            )
+
+            Text(progressText)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var progressText: String {
+        if viewModel.batchProgressCurrentIndex > 0 {
+            return "当前正在处理第 \(viewModel.batchProgressCurrentIndex) 首，已完成 \(viewModel.batchProgressCompleted) 首。"
+        }
+        return "正在准备批量生成任务。"
+    }
+}
+
 struct HistoryPanel: View {
     @EnvironmentObject private var viewModel: MusicGeneratorViewModel
 
     var selectedItem: GenerationHistoryItem? {
         guard let selectedID = viewModel.selectedHistoryID else { return nil }
-        return viewModel.history.first { $0.id == selectedID }
+        return viewModel.filteredHistory.first { $0.id == selectedID }
     }
 
     var body: some View {
@@ -376,13 +492,19 @@ struct HistoryPanel: View {
                 }
             }
 
-            if viewModel.history.isEmpty {
+            HStack(spacing: 12) {
+                Toggle("仅看收藏", isOn: $viewModel.historyFavoritesOnly)
+                TextField("按分类筛选", text: $viewModel.historyTagFilter)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            if viewModel.filteredHistory.isEmpty {
                 Text("成功生成后会在这里记录提交参数、Seed、目录、文件路径和链接。")
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 10)
             } else {
                 HStack(alignment: .top, spacing: 14) {
-                    List(viewModel.history, selection: $viewModel.selectedHistoryID) { item in
+                    List(viewModel.filteredHistory, selection: $viewModel.selectedHistoryID) { item in
                         HistoryListRow(item: item)
                             .tag(item.id)
                             .onTapGesture {
@@ -440,6 +562,30 @@ struct TranscodePanel: View {
             Text("最新生成的音乐会自动加入转码列表，默认按 320 kbps / 44.1 kHz 处理。")
                 .foregroundStyle(.secondary)
 
+            HStack(spacing: 12) {
+                Label(ffmpegStatusText, systemImage: ffmpegSystemImage)
+                    .foregroundStyle(ffmpegStatusColor)
+
+                Button("刷新检测") {
+                    viewModel.refreshFFmpegStatus()
+                }
+                .buttonStyle(.bordered)
+
+                if case .unavailable = viewModel.ffmpegStatus {
+                    Button {
+                        Task { await viewModel.installFFmpeg() }
+                    } label: {
+                        Label("开始安装", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                if case .installing = viewModel.ffmpegStatus {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
             if let selectedItem {
                 Text("已添加文件：\(selectedItem.sourceFilename)")
                     .font(.callout)
@@ -476,7 +622,7 @@ struct TranscodePanel: View {
                     Label(viewModel.isTranscoding ? "转码中..." : "开始转码", systemImage: "arrow.triangle.2.circlepath")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(selectedItem == nil || viewModel.isTranscoding)
+                .disabled(selectedItem == nil || viewModel.isTranscoding || !ffmpegReady)
             }
 
             if viewModel.transcodeQueue.isEmpty {
@@ -508,6 +654,46 @@ struct TranscodePanel: View {
         }
         .padding(14)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var ffmpegReady: Bool {
+        if case .available = viewModel.ffmpegStatus {
+            return true
+        }
+        return false
+    }
+
+    private var ffmpegStatusText: String {
+        switch viewModel.ffmpegStatus {
+        case .available(let path):
+            return "ffmpeg 已就绪：\(path)"
+        case .unavailable:
+            return "未检测到 ffmpeg，可点击“开始安装”自动安装"
+        case .installing:
+            return "正在通过 Homebrew 安装 ffmpeg..."
+        }
+    }
+
+    private var ffmpegSystemImage: String {
+        switch viewModel.ffmpegStatus {
+        case .available:
+            return "checkmark.circle.fill"
+        case .unavailable:
+            return "exclamationmark.triangle.fill"
+        case .installing:
+            return "gearshape.2.fill"
+        }
+    }
+
+    private var ffmpegStatusColor: Color {
+        switch viewModel.ffmpegStatus {
+        case .available:
+            return .green
+        case .unavailable:
+            return .orange
+        case .installing:
+            return .secondary
+        }
     }
 }
 
@@ -590,15 +776,27 @@ struct HistoryListRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(item.title)
-                .lineLimit(2)
-                .font(.headline)
+            HStack(spacing: 6) {
+                if item.isFavorite {
+                    Image(systemName: "star.fill")
+                        .foregroundStyle(.yellow)
+                }
+                Text(item.title)
+                    .lineLimit(2)
+                    .font(.headline)
+            }
             HStack {
                 Text(item.createdAtText)
                 Text("Seed \(item.seed)")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            if !item.categoryText.isEmpty {
+                Text("分类：\(item.categoryText)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Text(URL(fileURLWithPath: item.filePath).lastPathComponent)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
@@ -618,6 +816,18 @@ struct HistoryDetail: View {
                 Text(item.createdAtText)
                     .font(.headline)
                 Spacer()
+                Button {
+                    viewModel.toggleFavorite(for: item.id)
+                } label: {
+                    Label(item.isFavorite ? "已收藏" : "收藏", systemImage: item.isFavorite ? "star.fill" : "star")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    viewModel.playFile(url: item.fileURL)
+                } label: {
+                    Label("播放此条", systemImage: "play.circle")
+                }
+                .buttonStyle(.bordered)
                 Button {
                     viewModel.loadHistoryParameters(item)
                 } label: {
@@ -639,7 +849,34 @@ struct HistoryDetail: View {
                 if let referenceAudioURL = item.referenceAudioURL {
                     HistoryField("参考音频", referenceAudioURL)
                 }
+                HistoryField("分类", item.categoryText.isEmpty ? "未设置" : item.categoryText)
                 HistoryField("选项", optionText)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("分类")
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 10) {
+                    Picker("分类列表", selection: Binding(
+                        get: { item.categoryText },
+                        set: { viewModel.updateCategory(for: item.id, category: $0) }
+                    )) {
+                        Text("未选择").tag("")
+                        ForEach(viewModel.categoryLibrary, id: \.self) { category in
+                            Text(category).tag(category)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    TextField(
+                        "输入新分类",
+                        text: Binding(
+                            get: { item.categoryText },
+                            set: { viewModel.updateCategory(for: item.id, category: $0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                }
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -670,6 +907,82 @@ struct HistoryDetail: View {
             item.lyricsOptimizer ? "歌词优化" : "不优化歌词",
             item.aigcWatermark ? "AI 水印" : "无 AI 水印"
         ].joined(separator: "，")
+    }
+}
+
+struct GlobalPlayerBar: View {
+    @EnvironmentObject private var viewModel: MusicGeneratorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: "music.note")
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(currentTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text("拖拽本地音频到这里即可直接播放；同一时间只会播放一首。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    viewModel.togglePlayback()
+                } label: {
+                    Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 28)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.currentPlaybackURL == nil)
+            }
+
+            HStack(spacing: 12) {
+                Text(formattedTime(viewModel.playbackPosition))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, alignment: .leading)
+
+                Slider(
+                    value: Binding(
+                        get: { viewModel.playbackPosition },
+                        set: { viewModel.seekPlayback(to: $0) }
+                    ),
+                    in: 0...max(viewModel.playbackDuration, 1)
+                )
+                .disabled(viewModel.currentPlaybackURL == nil)
+
+                Text(formattedTime(viewModel.playbackDuration))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(.bar)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            viewModel.acceptDroppedAudioFiles(providers)
+        }
+    }
+
+    private var currentTitle: String {
+        guard let url = viewModel.currentPlaybackURL else {
+            return "播放器待命中"
+        }
+        return url.lastPathComponent
+    }
+
+    private func formattedTime(_ time: Double) -> String {
+        guard time.isFinite, !time.isNaN else { return "00:00" }
+        let total = Int(time.rounded(.down))
+        let minutes = total / 60
+        let seconds = total % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 
