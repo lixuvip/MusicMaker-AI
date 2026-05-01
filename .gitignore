@@ -1,0 +1,13 @@
+.DS_Store
+
+.build/
+build/
+
+macos/.build/
+macos/build/
+
+windows/__pycache__/
+windows/.pycache/
+windows/build/
+windows/dist/
+windows/*.spec
