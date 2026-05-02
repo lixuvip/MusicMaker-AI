@@ -5,7 +5,7 @@
 ## 运行
 
 ```bash
-cd "/Users/sirius/Documents/Codex_Project/MusicMaker-AI/macos"
+cd macos
 chmod +x build_app.sh
 ./build_app.sh
 open build/MusicMaker-AI.app
