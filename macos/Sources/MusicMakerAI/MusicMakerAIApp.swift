@@ -13,6 +13,12 @@ struct MusicMakerAIApp: App {
         .windowStyle(.titleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandMenu("播放") {
+                Button("播放 / 暂停") {
+                    viewModel.togglePlaybackFromCommand()
+                }
+                .keyboardShortcut(.space, modifiers: [])
+            }
         }
     }
 }

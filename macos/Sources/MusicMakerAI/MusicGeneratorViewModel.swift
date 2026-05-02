@@ -22,6 +22,50 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         }
     }
 
+    enum HistoryReviewFilter: String, CaseIterable, Identifiable {
+        case all
+        case pending
+        case passed
+        case rejected
+        case selected
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .all:
+                return "全部状态"
+            case .pending:
+                return "待筛选"
+            case .passed:
+                return "已晋级"
+            case .rejected:
+                return "已淘汰"
+            case .selected:
+                return "已选中"
+            }
+        }
+    }
+
+    enum SelectionFilter: String, CaseIterable, Identifiable {
+        case all
+        case selectedOnly
+        case unselectedOnly
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .all:
+                return "全部结果"
+            case .selectedOnly:
+                return "仅看已选中"
+            case .unselectedOnly:
+                return "仅看未选中"
+            }
+        }
+    }
+
     @Published var baseURL: String {
         didSet { UserDefaults.standard.set(baseURL, forKey: Defaults.baseURL) }
     }
@@ -49,6 +93,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var bitrate: Int {
         didSet { UserDefaults.standard.set(bitrate, forKey: Defaults.bitrate) }
     }
+
     @Published var generationCount: Int {
         didSet { UserDefaults.standard.set(generationCount, forKey: Defaults.generationCount) }
     }
@@ -80,6 +125,19 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var generationCategory: String {
         didSet { UserDefaults.standard.set(generationCategory, forKey: Defaults.generationCategory) }
     }
+    @Published var projectLibrary: [GenerationProject] = []
+    @Published var draftProjectName = ""
+    @Published var selectedProjectID: GenerationProject.ID? {
+        didSet {
+            if let selectedProjectID {
+                UserDefaults.standard.set(selectedProjectID.uuidString, forKey: Defaults.selectedProjectID)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Defaults.selectedProjectID)
+            }
+
+            draftProjectName = activeProject?.name ?? ""
+        }
+    }
     @Published var isGenerating = false
     @Published var statusText = "准备就绪"
     @Published var errorMessage = ""
@@ -89,12 +147,15 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var lastSeed: Int?
     @Published var isPlaying = false
     @Published var currentPlaybackURL: URL?
+    @Published var currentlyPlayingHistoryID: GenerationHistoryItem.ID?
     @Published var playbackPosition: Double = 0
     @Published var playbackDuration: Double = 0
     @Published var history: [GenerationHistoryItem] = []
     @Published var selectedHistoryID: GenerationHistoryItem.ID?
-    @Published var historyFavoritesOnly = false
-    @Published var historyTagFilter = ""
+    @Published var historyReviewFilter: HistoryReviewFilter = .all
+    @Published var historySelectionFilter: SelectionFilter = .all
+    @Published var historyCategoryFilter = ""
+    @Published var historyProjectFilter: GenerationProject.ID?
     @Published var transcodeBitrateKbps: Int {
         didSet { UserDefaults.standard.set(transcodeBitrateKbps, forKey: Defaults.transcodeBitrateKbps) }
     }
@@ -115,6 +176,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
     @Published var batchProgressCompleted = 0
     @Published var batchProgressCurrentIndex = 0
 
+    private var historyLibrary = GenerationHistoryLibrary(projects: [], batches: [], tracks: [])
     private var player: AVAudioPlayer?
     private var playbackTimer: Timer?
 
@@ -133,6 +195,56 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
 
     var isBatchGeneration: Bool {
         generationCount > 1
+    }
+
+    var activeProject: GenerationProject? {
+        guard let selectedProjectID else { return nil }
+        return projectLibrary.first(where: { $0.id == selectedProjectID })
+    }
+
+    var availableHistoryCategories: [String] {
+        let values = Set(history.map(\.categoryText).filter { !$0.isEmpty })
+        return values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    var filteredHistory: [GenerationHistoryItem] {
+        history.filter { item in
+            let projectMatch = historyProjectFilter == nil || item.projectId == historyProjectFilter
+
+            let categoryMatch: Bool
+            let trimmedCategory = historyCategoryFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedCategory.isEmpty {
+                categoryMatch = true
+            } else {
+                categoryMatch = item.categoryText.caseInsensitiveCompare(trimmedCategory) == .orderedSame
+            }
+
+            let reviewMatch: Bool
+            switch historyReviewFilter {
+            case .all:
+                reviewMatch = true
+            case .pending:
+                reviewMatch = item.reviewDecision == .pending
+            case .passed:
+                reviewMatch = item.reviewDecision == .passed
+            case .rejected:
+                reviewMatch = item.reviewDecision == .rejected
+            case .selected:
+                reviewMatch = item.reviewDecision == .selected || item.isSelected
+            }
+
+            let selectionMatch: Bool
+            switch historySelectionFilter {
+            case .all:
+                selectionMatch = true
+            case .selectedOnly:
+                selectionMatch = item.isSelected
+            case .unselectedOnly:
+                selectionMatch = !item.isSelected
+            }
+
+            return projectMatch && categoryMatch && reviewMatch && selectionMatch
+        }
     }
 
     override init() {
@@ -160,10 +272,153 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         categoryLibrary = defaults.stringArray(forKey: Defaults.categoryLibrary) ?? []
         generationCategory = defaults.string(forKey: Defaults.generationCategory) ?? ""
         super.init()
-        history = GenerationHistoryStore.load(from: Self.historyURL)
+
+        let snapshot = GenerationHistoryStore.load(from: Self.historyURL)
+        historyLibrary = snapshot.library
         transcodeQueue = TranscodeQueueStore.load(from: Self.transcodeQueueURL)
-        rebuildCategoryLibraryIfNeeded()
+        refreshHistoryViews()
+        if let rawProjectID = defaults.string(forKey: Defaults.selectedProjectID), let uuid = UUID(uuidString: rawProjectID), projectLibrary.contains(where: { $0.id == uuid }) {
+            selectedProjectID = uuid
+        } else {
+            selectedProjectID = projectLibrary.first?.id
+        }
         refreshFFmpegStatus()
+    }
+
+    func createProject(named name: String? = nil) {
+        let baseName = name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? name!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : "项目 \(historyLibrary.projects.count + 1)"
+        let uniqueName = uniqueProjectName(from: baseName)
+        let now = Date()
+        let project = GenerationProject(
+            id: UUID(),
+            name: uniqueName,
+            createdAt: now,
+            updatedAt: now,
+            isArchived: false,
+            notes: nil
+        )
+        historyLibrary.projects.append(project)
+        selectedProjectID = project.id
+        historyProjectFilter = project.id
+        persistAndRefreshHistory()
+        draftProjectName = project.name
+        statusText = "已创建项目：\(project.name)"
+    }
+
+    func renameSelectedProject(to name: String) {
+        guard let selectedProjectID else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            draftProjectName = activeProject?.name ?? ""
+            return
+        }
+        guard let index = historyLibrary.projects.firstIndex(where: { $0.id == selectedProjectID }) else { return }
+        let uniqueName = uniqueProjectName(from: trimmed, excluding: selectedProjectID)
+        historyLibrary.projects[index].name = uniqueName
+        historyLibrary.projects[index].updatedAt = Date()
+        persistAndRefreshHistory()
+        draftProjectName = uniqueName
+        statusText = "项目已重命名为：\(uniqueName)"
+    }
+
+    func selectProject(_ projectID: GenerationProject.ID?) {
+        selectedProjectID = projectID
+        historyProjectFilter = projectID
+        if let projectName = activeProject?.name {
+            statusText = "当前项目：\(projectName)"
+        }
+    }
+
+    func moveTrack(_ id: GenerationHistoryItem.ID, toProject projectID: GenerationProject.ID) {
+        guard let trackIndex = historyLibrary.tracks.firstIndex(where: { $0.id == id }) else { return }
+        guard historyLibrary.projects.contains(where: { $0.id == projectID }) else { return }
+        guard let item = history.first(where: { $0.id == id }) else { return }
+
+        let originalProjectID = historyLibrary.tracks[trackIndex].projectId
+        guard originalProjectID != projectID else { return }
+
+        let targetBatchID: UUID
+        let orderInBatch: Int
+
+        if let existingBatch = historyLibrary.batches.first(where: {
+            $0.projectId == projectID &&
+            $0.prompt == item.prompt &&
+            $0.lyrics == item.lyrics &&
+            $0.model == item.model &&
+            $0.category == (item.categoryText.isEmpty ? nil : item.categoryText)
+        }) {
+            targetBatchID = existingBatch.id
+            orderInBatch = existingBatch.trackCount + 1
+        } else {
+            let batchID = UUID()
+            let now = Date()
+            let batch = GenerationBatch(
+                id: batchID,
+                projectId: projectID,
+                sequenceNumber: nextBatchSequenceNumber(in: projectID),
+                createdAt: now,
+                updatedAt: now,
+                name: nil,
+                baseURL: item.baseURL,
+                model: item.model,
+                prompt: item.prompt,
+                lyrics: item.lyrics,
+                outputFormat: item.outputFormat,
+                audioFormat: item.audioFormat,
+                sampleRate: item.sampleRate,
+                bitrate: item.bitrate,
+                lyricsOptimizer: item.lyricsOptimizer,
+                aigcWatermark: item.aigcWatermark,
+                instrumental: item.instrumental,
+                referenceAudioURL: item.referenceAudioURL,
+                category: item.categoryText.isEmpty ? nil : item.categoryText,
+                notes: nil,
+                trackCount: 0
+            )
+            historyLibrary.batches.append(batch)
+            targetBatchID = batchID
+            orderInBatch = 1
+        }
+
+        if let oldBatchIndex = historyLibrary.batches.firstIndex(where: { $0.id == historyLibrary.tracks[trackIndex].batchId }) {
+            historyLibrary.batches[oldBatchIndex].trackCount = max(historyLibrary.batches[oldBatchIndex].trackCount - 1, 0)
+            historyLibrary.batches[oldBatchIndex].updatedAt = Date()
+        }
+
+        historyLibrary.tracks[trackIndex].projectId = projectID
+        historyLibrary.tracks[trackIndex].batchId = targetBatchID
+        historyLibrary.tracks[trackIndex].orderInBatch = orderInBatch
+        historyLibrary.tracks[trackIndex].lastReviewedAt = Date()
+
+        if let targetBatchIndex = historyLibrary.batches.firstIndex(where: { $0.id == targetBatchID }) {
+            historyLibrary.batches[targetBatchIndex].trackCount += 1
+            historyLibrary.batches[targetBatchIndex].updatedAt = Date()
+        }
+
+        updateProjectTimestamp(projectID: originalProjectID, date: Date())
+        updateProjectTimestamp(projectID: projectID, date: Date())
+        selectedProjectID = projectID
+        historyProjectFilter = projectID
+        persistAndRefreshHistory(selecting: id)
+        if let movedItem = history.first(where: { $0.id == id }) {
+            statusText = "已移动到项目：\(movedItem.projectName)"
+        } else {
+            statusText = "已移动到新项目"
+        }
+    }
+
+    func isCurrentlyPlaying(_ item: GenerationHistoryItem) -> Bool {
+        currentlyPlayingHistoryID == item.id
+    }
+
+    func togglePlaybackFromCommand() {
+        if currentPlaybackURL == nil, let item = selectedHistoryItem {
+            playFile(url: item.fileURL)
+            return
+        }
+        togglePlayback()
     }
 
     func generate() async {
@@ -186,6 +441,42 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
             showError = true
             statusText = "Seed 无效"
             return
+        }
+
+        let project = ensureActiveProject()
+        let batchID = UUID()
+        let now = Date()
+        let normalizedCategory = nonEmpty(generationCategory)
+        let submittedLyrics = requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt)
+        let sequenceNumber = nextBatchSequenceNumber(in: project.id)
+
+        let batch = GenerationBatch(
+            id: batchID,
+            projectId: project.id,
+            sequenceNumber: sequenceNumber,
+            createdAt: now,
+            updatedAt: now,
+            name: nil,
+            baseURL: baseURL,
+            model: model.rawValue,
+            prompt: normalizedPrompt,
+            lyrics: submittedLyrics,
+            outputFormat: outputMode.rawValue,
+            audioFormat: audioFormat.rawValue,
+            sampleRate: sampleRate,
+            bitrate: bitrate,
+            lyricsOptimizer: lyricsOptimizer,
+            aigcWatermark: aigcWatermark,
+            instrumental: instrumental,
+            referenceAudioURL: model == .cover ? nonEmpty(referenceAudioURL) : nil,
+            category: normalizedCategory,
+            notes: nil,
+            trackCount: 0
+        )
+        historyLibrary.batches.append(batch)
+        updateProjectTimestamp(projectID: project.id, date: now)
+        if let normalizedCategory {
+            addCategoryToLibrary(normalizedCategory)
         }
 
         isGenerating = true
@@ -213,7 +504,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
                     request: MusicGenerationRequest(
                         model: model.rawValue,
                         prompt: normalizedPrompt,
-                        lyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt),
+                        lyrics: submittedLyrics,
                         outputFormat: outputMode.rawValue,
                         audioSetting: AudioSetting(
                             sampleRate: sampleRate,
@@ -233,12 +524,12 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
                 lastFileURL = savedURL
                 lastRemoteURL = result.remoteURL
                 appendHistory(
+                    batchID: batchID,
+                    projectID: project.id,
                     fileURL: savedURL,
                     remoteURL: result.remoteURL,
                     seed: currentSeed,
-                    submittedPrompt: normalizedPrompt,
-                    submittedLyrics: requestLyrics(from: normalizedLyrics, prompt: normalizedPrompt),
-                    category: generationCategory
+                    orderInBatch: index + 1
                 )
                 let transcodeID = enqueueLatestOutputForTranscoding(fileURL: savedURL)
                 completedCount += 1
@@ -248,6 +539,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
                     try preparePlayback(url: savedURL)
                 } else {
                     currentPlaybackURL = savedURL
+                    currentlyPlayingHistoryID = history.first(where: { $0.fileURL.standardizedFileURL == savedURL.standardizedFileURL })?.id
                     playbackPosition = 0
                     playbackDuration = 0
                 }
@@ -285,6 +577,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
             stopPlayback()
             try preparePlayback(url: url)
             currentPlaybackURL = url
+            currentlyPlayingHistoryID = history.first(where: { $0.fileURL.standardizedFileURL == url.standardizedFileURL })?.id
             statusText = "正在播放：\(url.lastPathComponent)"
         } catch {
             errorMessage = "播放失败：\(error.localizedDescription)"
@@ -324,6 +617,14 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([fileURL])
     }
 
+    func revealHistoryFile(_ item: GenerationHistoryItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([item.fileURL])
+    }
+
+    func openHistoryFolder(_ item: GenerationHistoryItem) {
+        NSWorkspace.shared.open(item.directoryURL)
+    }
+
     func copyOutputFile() {
         guard let fileURL = lastFileURL else { return }
         let pasteboard = NSPasteboard.general
@@ -349,6 +650,8 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         lastFileURL = item.fileURL
         lastRemoteURL = item.remoteURL.flatMap(URL.init(string:))
         lastSeed = item.seed
+        historyProjectFilter = item.projectId
+        selectedProjectID = item.projectId
         statusText = "已选择历史记录，Seed: \(item.seed)"
     }
 
@@ -366,36 +669,31 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         prompt = item.prompt
         lyrics = item.lyrics
         referenceAudioURL = item.referenceAudioURL ?? ""
+        generationCategory = item.categoryText
         selectHistory(item)
         statusText = "已加载历史参数，Seed: \(item.seed)"
     }
 
     func clearHistory() {
-        history.removeAll()
+        historyLibrary = GenerationHistoryLibrary(projects: projectLibrary.isEmpty ? [] : [ensureActiveProject()], batches: [], tracks: [])
         selectedHistoryID = nil
-        do {
-            try GenerationHistoryStore.save(history, to: Self.historyURL)
-            statusText = "历史记录已清空"
-        } catch {
-            errorMessage = "清空历史失败：\(error.localizedDescription)"
-            showError = true
-        }
-    }
-
-    func toggleFavorite(for id: GenerationHistoryItem.ID) {
-        guard let index = history.firstIndex(where: { $0.id == id }) else { return }
-        history[index].isFavorite.toggle()
+        refreshHistoryViews()
         persistHistory()
+        statusText = "历史记录已清空"
     }
 
     func updateCategory(for id: GenerationHistoryItem.ID, category: String) {
-        guard let index = history.firstIndex(where: { $0.id == id }) else { return }
+        guard let item = history.first(where: { $0.id == id }) else { return }
         let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
-        history[index].favoriteTag = trimmed.isEmpty ? nil : trimmed
-        if !trimmed.isEmpty {
-            addCategoryToLibrary(trimmed)
+        if let batchIndex = historyLibrary.batches.firstIndex(where: { $0.id == item.batchId }) {
+            historyLibrary.batches[batchIndex].category = trimmed.isEmpty ? nil : trimmed
+            historyLibrary.batches[batchIndex].updatedAt = Date()
+            if !trimmed.isEmpty {
+                addCategoryToLibrary(trimmed)
+            }
+            updateProjectTimestamp(projectID: item.projectId, date: Date())
+            persistAndRefreshHistory()
         }
-        persistHistory()
     }
 
     func addGenerationCategoryToLibrary() {
@@ -409,18 +707,52 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         generationCategory = category
     }
 
-    var filteredHistory: [GenerationHistoryItem] {
-        history.filter { item in
-            let favoriteMatch = !historyFavoritesOnly || item.isFavorite
-            let trimmedFilter = historyTagFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-            let tagMatch: Bool
-            if trimmedFilter.isEmpty {
-                tagMatch = true
-            } else {
-                tagMatch = item.categoryText.lowercased().contains(trimmedFilter.lowercased())
-            }
-            return favoriteMatch && tagMatch
+    func markReviewRound(for id: GenerationHistoryItem.ID, round: Int) {
+        guard let index = historyLibrary.tracks.firstIndex(where: { $0.id == id }) else { return }
+        let normalizedRound = max(0, min(10, round))
+        historyLibrary.tracks[index].reviewRound = normalizedRound
+        historyLibrary.tracks[index].reviewDecision = normalizedRound == 0 ? .pending : .passed
+        historyLibrary.tracks[index].lastReviewedAt = Date()
+        if normalizedRound == 0 {
+            historyLibrary.tracks[index].isSelected = false
+            historyLibrary.tracks[index].selectedAt = nil
         }
+        persistAndRefreshHistory()
+    }
+
+    func advanceToNextRound(for id: GenerationHistoryItem.ID) {
+        guard let item = history.first(where: { $0.id == id }) else { return }
+        let nextRound = min(item.reviewRound + 1, 10)
+        markReviewRound(for: id, round: nextRound)
+    }
+
+    func rejectTrack(_ id: GenerationHistoryItem.ID) {
+        guard let index = historyLibrary.tracks.firstIndex(where: { $0.id == id }) else { return }
+        historyLibrary.tracks[index].reviewDecision = .rejected
+        historyLibrary.tracks[index].isSelected = false
+        historyLibrary.tracks[index].selectedAt = nil
+        historyLibrary.tracks[index].lastReviewedAt = Date()
+        persistAndRefreshHistory()
+    }
+
+    func toggleSelected(for id: GenerationHistoryItem.ID) {
+        guard let index = historyLibrary.tracks.firstIndex(where: { $0.id == id }) else { return }
+        let nextValue = !historyLibrary.tracks[index].isSelected
+        historyLibrary.tracks[index].isSelected = nextValue
+        historyLibrary.tracks[index].selectedAt = nextValue ? Date() : nil
+        historyLibrary.tracks[index].reviewDecision = nextValue ? .selected : (historyLibrary.tracks[index].reviewRound > 0 ? .passed : .pending)
+        historyLibrary.tracks[index].lastReviewedAt = Date()
+        persistAndRefreshHistory()
+    }
+
+    func updateTrackNotes(for id: GenerationHistoryItem.ID, notes: String) {
+        guard let index = historyLibrary.tracks.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        historyLibrary.tracks[index].notes = trimmed.isEmpty ? nil : notes
+        historyLibrary.tracks[index].lastReviewedAt = Date()
+        updateProjectTimestamp(projectID: historyLibrary.tracks[index].projectId, date: Date())
+        persistAndRefreshHistory(selecting: id)
+        statusText = trimmed.isEmpty ? "备注已清空" : "备注已保存"
     }
 
     func runSelectedTranscode() async {
@@ -584,6 +916,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         player?.prepareToPlay()
         player?.play()
         currentPlaybackURL = url
+        currentlyPlayingHistoryID = history.first(where: { $0.fileURL.standardizedFileURL == url.standardizedFileURL })?.id
         playbackDuration = player?.duration ?? 0
         playbackPosition = player?.currentTime ?? 0
         isPlaying = true
@@ -595,6 +928,7 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         player = nil
         isPlaying = false
         currentPlaybackURL = nil
+        currentlyPlayingHistoryID = nil
         playbackPosition = 0
         playbackDuration = 0
         stopPlaybackTimer()
@@ -665,36 +999,59 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         return fileURL
     }
 
-    private func appendHistory(fileURL: URL, remoteURL: URL?, seed: Int, submittedPrompt: String, submittedLyrics: String, category: String) {
-        let item = GenerationHistoryItem(
+    private func appendHistory(batchID: UUID, projectID: UUID, fileURL: URL, remoteURL: URL?, seed: Int, orderInBatch: Int) {
+        let track = GenerationTrack(
             id: UUID(),
-            createdAt: Date(),
-            baseURL: baseURL,
-            model: model.rawValue,
-            prompt: submittedPrompt,
-            lyrics: submittedLyrics,
-            outputFormat: outputMode.rawValue,
-            audioFormat: audioFormat.rawValue,
-            sampleRate: sampleRate,
-            bitrate: bitrate,
-            lyricsOptimizer: lyricsOptimizer,
-            aigcWatermark: aigcWatermark,
-            instrumental: instrumental,
-            referenceAudioURL: model == .cover ? nonEmpty(referenceAudioURL) : nil,
+            projectId: projectID,
+            batchId: batchID,
+            orderInBatch: orderInBatch,
             seed: seed,
+            createdAt: Date(),
             directoryPath: fileURL.deletingLastPathComponent().path,
             filePath: fileURL.path,
             remoteURL: remoteURL?.absoluteString,
-            isFavorite: false,
-            favoriteTag: category.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : category.trimmingCharacters(in: .whitespacesAndNewlines)
+            displayName: nil,
+            notes: nil,
+            reviewRound: 0,
+            reviewDecision: .pending,
+            reviewTags: [],
+            isSelected: false,
+            selectedAt: nil,
+            lastReviewedAt: nil
         )
-        history.insert(item, at: 0)
-        selectedHistoryID = item.id
-        if let savedCategory = item.favoriteTag, !savedCategory.isEmpty {
-            addCategoryToLibrary(savedCategory)
+        historyLibrary.tracks.insert(track, at: 0)
+        if let batchIndex = historyLibrary.batches.firstIndex(where: { $0.id == batchID }) {
+            historyLibrary.batches[batchIndex].trackCount += 1
+            historyLibrary.batches[batchIndex].updatedAt = Date()
+        }
+        updateProjectTimestamp(projectID: projectID, date: Date())
+        persistAndRefreshHistory(selecting: track.id)
+    }
+
+    private func ensureActiveProject() -> GenerationProject {
+        if let selectedProjectID, let project = historyLibrary.projects.first(where: { $0.id == selectedProjectID }) {
+            return project
         }
 
-        persistHistory()
+        if let existing = historyLibrary.projects.first(where: { !$0.isArchived }) {
+            selectedProjectID = existing.id
+            return existing
+        }
+
+        let project = GenerationProject.default()
+        historyLibrary.projects.append(project)
+        selectedProjectID = project.id
+        return project
+    }
+
+    private func nextBatchSequenceNumber(in projectID: UUID) -> Int {
+        let existing = historyLibrary.batches.filter { $0.projectId == projectID }.map(\.sequenceNumber)
+        return (existing.max() ?? 0) + 1
+    }
+
+    private func updateProjectTimestamp(projectID: UUID, date: Date) {
+        guard let projectIndex = historyLibrary.projects.firstIndex(where: { $0.id == projectID }) else { return }
+        historyLibrary.projects[projectIndex].updatedAt = date
     }
 
     private func addCategoryToLibrary(_ category: String) {
@@ -707,6 +1064,42 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
         }
     }
 
+    private func refreshHistoryViews() {
+        let snapshot = GenerationHistorySnapshot(library: historyLibrary)
+        history = snapshot.items
+        projectLibrary = snapshot.projects
+        if let activeProject {
+            draftProjectName = activeProject.name
+        }
+        rebuildCategoryLibraryIfNeeded()
+    }
+
+    private var selectedHistoryItem: GenerationHistoryItem? {
+        guard let selectedHistoryID else { return nil }
+        return history.first(where: { $0.id == selectedHistoryID })
+    }
+
+    private func uniqueProjectName(from proposedName: String, excluding excludedID: UUID? = nil) -> String {
+        let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "默认项目" }
+
+        let existingNames = Set(
+            historyLibrary.projects
+                .filter { $0.id != excludedID }
+                .map { $0.name.lowercased() }
+        )
+
+        if !existingNames.contains(trimmed.lowercased()) {
+            return trimmed
+        }
+
+        var index = 2
+        while existingNames.contains("\(trimmed) \(index)".lowercased()) {
+            index += 1
+        }
+        return "\(trimmed) \(index)"
+    }
+
     private func rebuildCategoryLibraryIfNeeded() {
         for item in history {
             if !item.categoryText.isEmpty {
@@ -717,11 +1110,19 @@ final class MusicGeneratorViewModel: NSObject, ObservableObject {
 
     private func persistHistory() {
         do {
-            try GenerationHistoryStore.save(history, to: Self.historyURL)
+            try GenerationHistoryStore.save(historyLibrary, to: Self.historyURL)
         } catch {
             errorMessage = "历史记录保存失败：\(error.localizedDescription)"
             showError = true
         }
+    }
+
+    private func persistAndRefreshHistory(selecting trackID: GenerationTrack.ID? = nil) {
+        refreshHistoryViews()
+        if let trackID {
+            selectedHistoryID = trackID
+        }
+        persistHistory()
     }
 
     private static func outputDirectory() throws -> URL {
@@ -952,6 +1353,7 @@ private enum Defaults {
     static let autoPlayAfterGeneration = "autoPlayAfterGeneration"
     static let generationCategory = "generationCategory"
     static let categoryLibrary = "categoryLibrary"
+    static let selectedProjectID = "selectedProjectID"
     static let lyricsOptimizer = "lyricsOptimizer"
     static let instrumental = "instrumental"
     static let aigcWatermark = "aigcWatermark"

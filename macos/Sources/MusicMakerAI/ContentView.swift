@@ -31,6 +31,11 @@ struct ContentView: View {
         } message: {
             Text(viewModel.errorMessage)
         }
+        .background(
+            PlaybackShortcutMonitor {
+                viewModel.togglePlaybackFromCommand()
+            }
+        )
     }
 }
 
@@ -95,6 +100,69 @@ struct ModuleSidebar: View {
             .tag(module)
         }
         .navigationTitle("工具")
+    }
+}
+
+struct PlaybackShortcutMonitor: NSViewRepresentable {
+    let onSpace: () -> Void
+
+    func makeNSView(context: Context) -> PlaybackShortcutMonitorView {
+        let view = PlaybackShortcutMonitorView()
+        view.onSpace = onSpace
+        return view
+    }
+
+    func updateNSView(_ nsView: PlaybackShortcutMonitorView, context: Context) {
+        nsView.onSpace = onSpace
+    }
+}
+
+final class PlaybackShortcutMonitorView: NSView {
+    var onSpace: (() -> Void)?
+    private var localMonitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            removeMonitor()
+        } else {
+            installMonitorIfNeeded()
+        }
+    }
+
+    private func installMonitorIfNeeded() {
+        guard localMonitor == nil else { return }
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handle(event: event)
+        }
+    }
+
+    private func removeMonitor() {
+        if let localMonitor {
+            NSEvent.removeMonitor(localMonitor)
+            self.localMonitor = nil
+        }
+    }
+
+    private func handle(event: NSEvent) -> NSEvent? {
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty else {
+            return event
+        }
+        guard event.charactersIgnoringModifiers == " " else {
+            return event
+        }
+        guard !isEditingText else {
+            return event
+        }
+
+        onSpace?()
+        return nil
+    }
+
+    private var isEditingText: Bool {
+        guard let responder = window?.firstResponder else { return false }
+        return responder is NSTextView
     }
 }
 
@@ -266,6 +334,8 @@ struct GeneratorPanel: View {
                         .foregroundStyle(.secondary)
                 }
 
+                ProjectPanel()
+
                 VStack(alignment: .leading, spacing: 8) {
                     Label("音乐要求", systemImage: "slider.horizontal.3")
                         .font(.headline)
@@ -347,6 +417,60 @@ struct GeneratorPanel: View {
                 Spacer(minLength: 0)
             }
             .padding(28)
+        }
+    }
+}
+
+struct ProjectPanel: View {
+    @EnvironmentObject private var viewModel: MusicGeneratorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("当前项目", systemImage: "folder.badge.person.crop")
+                .font(.headline)
+
+            HStack(spacing: 10) {
+                Picker("项目", selection: Binding(
+                    get: { viewModel.selectedProjectID },
+                    set: { viewModel.selectProject($0) }
+                )) {
+                    ForEach(viewModel.projectLibrary) { project in
+                        Text(project.name).tag(Optional(project.id))
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Button {
+                    viewModel.createProject()
+                } label: {
+                    Label("新建项目", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            TextField("项目名称", text: $viewModel.draftProjectName)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit {
+                    viewModel.renameSelectedProject(to: viewModel.draftProjectName)
+                }
+
+            HStack(spacing: 10) {
+                Button("保存项目名称") {
+                    viewModel.renameSelectedProject(to: viewModel.draftProjectName)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.selectedProjectID == nil)
+
+                if let activeProject = viewModel.activeProject {
+                    Text("当前写入：\(activeProject.name)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text("生成时会先落到当前项目，再在项目下创建批次并写入单曲结果。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -475,7 +599,7 @@ struct HistoryPanel: View {
 
     var selectedItem: GenerationHistoryItem? {
         guard let selectedID = viewModel.selectedHistoryID else { return nil }
-        return viewModel.filteredHistory.first { $0.id == selectedID }
+        return viewModel.history.first { $0.id == selectedID }
     }
 
     var body: some View {
@@ -492,14 +616,10 @@ struct HistoryPanel: View {
                 }
             }
 
-            HStack(spacing: 12) {
-                Toggle("仅看收藏", isOn: $viewModel.historyFavoritesOnly)
-                TextField("按分类筛选", text: $viewModel.historyTagFilter)
-                    .textFieldStyle(.roundedBorder)
-            }
+            HistoryFilterBar()
 
             if viewModel.filteredHistory.isEmpty {
-                Text("成功生成后会在这里记录提交参数、Seed、目录、文件路径和链接。")
+                Text("成功生成后会在这里记录项目、批次、轮次、文件路径和筛选状态。")
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 10)
             } else {
@@ -527,6 +647,61 @@ struct HistoryPanel: View {
         }
         .padding(14)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct HistoryFilterBar: View {
+    @EnvironmentObject private var viewModel: MusicGeneratorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Picker("项目", selection: $viewModel.historyProjectFilter) {
+                    Text("全部项目").tag(Optional<GenerationProject.ID>.none)
+                    ForEach(viewModel.projectLibrary) { project in
+                        Text(project.name).tag(Optional(project.id))
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Picker("轮次", selection: $viewModel.historyReviewFilter) {
+                    ForEach(MusicGeneratorViewModel.HistoryReviewFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Picker("选中状态", selection: $viewModel.historySelectionFilter) {
+                    ForEach(MusicGeneratorViewModel.SelectionFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            HStack(spacing: 12) {
+                Picker("分类", selection: $viewModel.historyCategoryFilter) {
+                    Text("全部分类").tag("")
+                    ForEach(viewModel.availableHistoryCategories, id: \.self) { category in
+                        Text(category).tag(category)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                if !viewModel.historyCategoryFilter.isEmpty {
+                    Button("清除分类") {
+                        viewModel.historyCategoryFilter = ""
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Spacer()
+
+                Text("共 \(viewModel.filteredHistory.count) 条")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -772,60 +947,209 @@ struct TranscodeDetail: View {
 }
 
 struct HistoryListRow: View {
+    @EnvironmentObject private var viewModel: MusicGeneratorViewModel
     let item: GenerationHistoryItem
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                if item.isFavorite {
-                    Image(systemName: "star.fill")
-                        .foregroundStyle(.yellow)
-                }
-                Text(item.title)
-                    .lineLimit(2)
-                    .font(.headline)
-            }
-            HStack {
-                Text(item.createdAtText)
-                Text("Seed \(item.seed)")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            if !item.categoryText.isEmpty {
-                Text("分类：\(item.categoryText)")
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        if viewModel.isCurrentlyPlaying(item) {
+                            Label("播放中", systemImage: viewModel.isPlaying ? "speaker.wave.2.fill" : "pause.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                        }
+
+                        if let notes = item.notes?.trimmingCharacters(in: .whitespacesAndNewlines), !notes.isEmpty {
+                            Label("有备注", systemImage: "note.text")
+                                .font(.caption)
+                                .foregroundStyle(.teal)
+                                .help(notes)
+                        }
+
+                        Text(listTitle)
+                            .lineLimit(1)
+                            .font(.headline)
+                            .foregroundStyle(titleColor)
+                    }
+
+                    HStack(spacing: 8) {
+                        Text(item.createdAtText)
+                        Text(item.projectName)
+                        if !item.categoryText.isEmpty {
+                            Text(item.categoryText)
+                        }
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+
+                    HStack(spacing: 8) {
+                        HistoryStatusBadge(
+                            title: roundTitle,
+                            systemImage: roundSystemImage,
+                            foregroundColor: statusColor,
+                            backgroundColor: statusBackgroundColor
+                        )
+                        if item.isSelected {
+                            HistoryStatusBadge(
+                                title: "最终选中",
+                                systemImage: "checkmark.seal.fill",
+                                foregroundColor: .green,
+                                backgroundColor: .green.opacity(0.12)
+                            )
+                        }
+                    }
+                    .font(.caption)
+                }
+
+                Spacer(minLength: 8)
+
+                HStack(spacing: 6) {
+                    Button {
+                        viewModel.playFile(url: item.fileURL)
+                    } label: {
+                        Image(systemName: "play.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("播放")
+
+                    Button {
+                        viewModel.openHistoryFolder(item)
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("打开文件夹")
+
+                    Button {
+                        viewModel.advanceToNextRound(for: item.id)
+                    } label: {
+                        Image(systemName: "arrow.right.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("推进下一轮")
+
+                    Button {
+                        viewModel.toggleSelected(for: item.id)
+                    } label: {
+                        Image(systemName: item.isSelected ? "checkmark.circle.fill" : "circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(item.isSelected ? "取消已选中" : "标记已选中")
+                }
             }
-            Text(URL(fileURLWithPath: item.filePath).lastPathComponent)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
         }
         .padding(.vertical, 4)
+    }
+
+    private var roundTitle: String {
+        if item.reviewDecision == .rejected {
+            return "已淘汰"
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return "最终选中"
+        }
+        if item.reviewRound > 0 {
+            return "第 \(item.reviewRound) 轮"
+        }
+        return "待筛选"
+    }
+
+    private var roundSystemImage: String {
+        if item.reviewDecision == .rejected {
+            return "xmark.circle"
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return "checkmark.circle"
+        }
+        if item.reviewRound > 0 {
+            return "arrow.triangle.branch"
+        }
+        return "clock"
+    }
+
+    private var titleColor: Color {
+        if item.reviewDecision == .rejected {
+            return .secondary
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return .green
+        }
+        if item.reviewRound > 0 {
+            return .orange
+        }
+        return .primary
+    }
+
+    private var statusColor: Color {
+        if item.reviewDecision == .rejected {
+            return .red
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return .green
+        }
+        if item.reviewRound > 0 {
+            return .orange
+        }
+        return .secondary
+    }
+
+    private var statusBackgroundColor: Color {
+        if item.reviewDecision == .rejected {
+            return .red.opacity(0.12)
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return .green.opacity(0.12)
+        }
+        if item.reviewRound > 0 {
+            return .yellow.opacity(0.18)
+        }
+        return .secondary.opacity(0.10)
+    }
+
+    private var listTitle: String {
+        "\(item.projectName) \(item.batchCode)"
     }
 }
 
 struct HistoryDetail: View {
     @EnvironmentObject private var viewModel: MusicGeneratorViewModel
+    @State private var targetProjectID: GenerationProject.ID?
+    @State private var notesDraft = ""
+    @State private var showAdvancedDetails = false
+    @State private var showManagementTools = false
+    @State private var showPromptDetails = false
+    @State private var showLyricsDetails = false
     let item: GenerationHistoryItem
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(item.createdAtText)
-                    .font(.headline)
-                Spacer()
-                Button {
-                    viewModel.toggleFavorite(for: item.id)
-                } label: {
-                    Label(item.isFavorite ? "已收藏" : "收藏", systemImage: item.isFavorite ? "star.fill" : "star")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.batchCode)
+                        .font(.headline.monospaced())
+                    Text(item.createdAtText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.bordered)
+                Spacer()
                 Button {
                     viewModel.playFile(url: item.fileURL)
                 } label: {
                     Label("播放此条", systemImage: "play.circle")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    viewModel.openHistoryFolder(item)
+                } label: {
+                    Label("打开文件夹", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    viewModel.revealHistoryFile(item)
+                } label: {
+                    Label("定位文件", systemImage: "scope")
                 }
                 .buttonStyle(.bordered)
                 Button {
@@ -837,67 +1161,179 @@ struct HistoryDetail: View {
             }
 
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
-                HistoryField("模型", item.model)
-                HistoryField("Seed", String(item.seed))
-                HistoryField("输出", "\(item.outputFormat) / \(item.audioFormat)")
-                HistoryField("音频", "\(item.sampleRate) Hz / \(item.bitrate) bps")
-                HistoryField("目录", item.directoryPath)
-                HistoryField("文件", item.filePath)
-                if let remoteURL = item.remoteURL {
-                    HistoryField("远端链接", remoteURL)
-                }
-                if let referenceAudioURL = item.referenceAudioURL {
-                    HistoryField("参考音频", referenceAudioURL)
-                }
+                HistoryField("项目", item.projectName)
+                HistoryField("批次", item.batchCode)
+                HistoryTintedField(label: "轮次", value: reviewRoundText, color: statusColor)
+                HistoryTintedField(label: "状态", value: item.reviewDecision.title, color: statusColor)
+                HistoryTintedField(label: "是否选中", value: item.isSelected ? "是" : "否", color: item.isSelected ? .green : .secondary)
                 HistoryField("分类", item.categoryText.isEmpty ? "未设置" : item.categoryText)
                 HistoryField("选项", optionText)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("分类")
-                    .font(.subheadline.weight(.semibold))
-                HStack(spacing: 10) {
-                    Picker("分类列表", selection: Binding(
-                        get: { item.categoryText },
-                        set: { viewModel.updateCategory(for: item.id, category: $0) }
-                    )) {
-                        Text("未选择").tag("")
-                        ForEach(viewModel.categoryLibrary, id: \.self) { category in
-                            Text(category).tag(category)
-                        }
+            HistoryDisclosureSection(
+                title: showAdvancedDetails ? "收起详细参数" : "展开详细参数",
+                isExpanded: $showAdvancedDetails
+            ) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
+                    HistoryField("模型", item.model)
+                    HistoryField("Seed", String(item.seed))
+                    HistoryField("输出", "\(item.outputFormat) / \(item.audioFormat)")
+                    HistoryField("音频", "\(item.sampleRate) Hz / \(item.bitrate) bps")
+                    HistoryField("目录", item.directoryPath)
+                    HistoryField("文件", item.filePath)
+                    if let remoteURL = item.remoteURL {
+                        HistoryField("远端链接", remoteURL)
                     }
-                    .pickerStyle(.menu)
+                    if let referenceAudioURL = item.referenceAudioURL {
+                        HistoryField("参考音频", referenceAudioURL)
+                    }
+                }
+                .padding(.top, 8)
+            }
+            .padding(.vertical, 4)
 
-                    TextField(
-                        "输入新分类",
-                        text: Binding(
-                            get: { item.categoryText },
-                            set: { viewModel.updateCategory(for: item.id, category: $0) }
-                        )
-                    )
+            VStack(alignment: .leading, spacing: 8) {
+                Text("备注")
+                    .font(.subheadline.weight(.semibold))
+
+                TextField("输入备注", text: $notesDraft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...6)
+
+                HStack(spacing: 10) {
+                    Button("保存备注") {
+                        viewModel.updateTrackNotes(for: item.id, notes: notesDraft)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("清空备注") {
+                        notesDraft = ""
+                        viewModel.updateTrackNotes(for: item.id, notes: "")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer()
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("音乐要求")
-                    .font(.subheadline.weight(.semibold))
+            HistoryDisclosureSection(
+                title: showManagementTools ? "收起管理工具" : "展开管理工具",
+                isExpanded: $showManagementTools
+            ) {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("移动到项目")
+                            .font(.subheadline.weight(.semibold))
+
+                        HStack(spacing: 10) {
+                            Picker("目标项目", selection: $targetProjectID) {
+                                Text("选择目标项目").tag(Optional<GenerationProject.ID>.none)
+                                ForEach(availableMoveProjects) { project in
+                                    Text(project.name).tag(Optional(project.id))
+                                }
+                            }
+                            .pickerStyle(.menu)
+
+                            Button("移动") {
+                                if let projectID = targetProjectID {
+                                    viewModel.moveTrack(item.id, toProject: projectID)
+                                    targetProjectID = nil
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(targetProjectID == nil)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("分类")
+                            .font(.subheadline.weight(.semibold))
+                        HStack(spacing: 10) {
+                            Picker("分类列表", selection: Binding(
+                                get: { item.categoryText },
+                                set: { viewModel.updateCategory(for: item.id, category: $0) }
+                            )) {
+                                Text("未选择").tag("")
+                                ForEach(viewModel.categoryLibrary, id: \.self) { category in
+                                    Text(category).tag(category)
+                                }
+                            }
+                            .pickerStyle(.menu)
+
+                            TextField(
+                                "输入新分类",
+                                text: Binding(
+                                    get: { item.categoryText },
+                                    set: { viewModel.updateCategory(for: item.id, category: $0) }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                }
+                .padding(.top, 8)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    viewModel.advanceToNextRound(for: item.id)
+                } label: {
+                    Label("推进下一轮", systemImage: "arrow.right.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(item.isSelected)
+
+                Button {
+                    viewModel.toggleSelected(for: item.id)
+                } label: {
+                    Label(item.isSelected ? "取消选中" : "标记已选中", systemImage: item.isSelected ? "checkmark.circle.fill" : "circle")
+                }
+                .buttonStyle(.bordered)
+
+                Button(role: .destructive) {
+                    viewModel.rejectTrack(item.id)
+                } label: {
+                    Label("淘汰", systemImage: "xmark.circle")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            HistoryDisclosureSection(
+                title: showPromptDetails ? "收起音乐要求" : "展开音乐要求",
+                isExpanded: $showPromptDetails
+            ) {
                 Text(item.prompt)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
                     .background(.background.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+                    .padding(.top, 8)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("歌词")
-                    .font(.subheadline.weight(.semibold))
+            HistoryDisclosureSection(
+                title: showLyricsDetails ? "收起歌词" : "展开歌词",
+                isExpanded: $showLyricsDetails
+            ) {
                 Text(item.lyrics)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
                     .background(.background.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+                    .padding(.top, 8)
             }
+        }
+        .onAppear {
+            if targetProjectID == nil {
+                targetProjectID = availableMoveProjects.first?.id
+            }
+            notesDraft = item.notes ?? ""
+        }
+        .onChange(of: item.projectId) { _ in
+            targetProjectID = availableMoveProjects.first?.id
+        }
+        .onChange(of: item.id) { _ in
+            targetProjectID = availableMoveProjects.first?.id
+            notesDraft = item.notes ?? ""
         }
     }
 
@@ -907,6 +1343,114 @@ struct HistoryDetail: View {
             item.lyricsOptimizer ? "歌词优化" : "不优化歌词",
             item.aigcWatermark ? "AI 水印" : "无 AI 水印"
         ].joined(separator: "，")
+    }
+
+    private var reviewRoundText: String {
+        if item.isSelected || item.reviewDecision == .selected {
+            return "最终 selected"
+        }
+        if item.reviewDecision == .rejected {
+            return "已淘汰"
+        }
+        if item.reviewRound == 0 {
+            return "待筛选"
+        }
+        return "第 \(item.reviewRound) 轮"
+    }
+
+    private var statusColor: Color {
+        if item.reviewDecision == .rejected {
+            return .red
+        }
+        if item.isSelected || item.reviewDecision == .selected {
+            return .green
+        }
+        if item.reviewRound > 0 {
+            return .orange
+        }
+        return .secondary
+    }
+
+    private var availableMoveProjects: [GenerationProject] {
+        viewModel.projectLibrary.filter { $0.id != item.projectId }
+    }
+}
+
+struct HistoryTintedField: View {
+    let label: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(label)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+
+            Text(value)
+                .foregroundStyle(color)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+struct HistoryStatusBadge: View {
+    let title: String
+    let systemImage: String
+    let foregroundColor: Color
+    let backgroundColor: Color
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(backgroundColor, in: Capsule())
+            .foregroundStyle(foregroundColor)
+    }
+}
+
+struct HistoryDisclosureSection<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                isExpanded.toggle()
+            } label: {
+                DisclosureHeader(title: title, isExpanded: isExpanded)
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content()
+            }
+        }
+    }
+}
+
+struct DisclosureHeader: View {
+    let title: String
+    let isExpanded: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isExpanded ? "chevron.down.circle.fill" : "chevron.right.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.quaternary.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 

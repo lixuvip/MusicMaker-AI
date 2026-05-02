@@ -22,10 +22,10 @@ import tkinter as tk
 APP_NAME = "MusicMaker-AI"
 SEED_MIN = 0
 SEED_MAX = 1_000_000
+MAX_BATCH_COUNT = 10
 
-# ── Transcode defaults ──────────────────────────────────────────────
-TRANSCODE_BITRATES = [128, 192, 256, 320]        # KBps
-TRANSCODE_SAMPLE_RATES = [22050, 32000, 44100, 48000]  # Hz
+TRANSCODE_BITRATES = [128, 192, 256, 320]
+TRANSCODE_SAMPLE_RATES = [22050, 32000, 44100, 48000]
 TRANSCODE_FORMATS = ["mp3", "wav", "flac", "aac", "ogg"]
 DEFAULT_TRANSCODE_BITRATE = 320
 DEFAULT_TRANSCODE_SAMPLE_RATE = 44100
@@ -52,24 +52,26 @@ class HistoryItem:
     directory_path: str
     file_path: str
     remote_url: str
+    is_favorite: bool = False
+    category: str = ""
+    batch_id: str = ""
+    batch_index: int = 1
+    batch_total: int = 1
 
 
 @dataclass
 class TranscodeItem:
-    """A single file queued for transcoding."""
     id: str
     source_path: str
     source_filename: str
-    target_bitrate: int        # bps (e.g. 320000)
-    target_sample_rate: int    # Hz  (e.g. 44100)
-    target_format: str         # mp3 / wav / flac / …
-    status: str = "等待转码"   # 等待转码 / 转码中… / 已完成 / 失败
+    target_bitrate: int
+    target_sample_rate: int
+    target_format: str
+    status: str = "等待转码"
     output_path: str = ""
     error_message: str = ""
-    auto_added: bool = False   # True when added automatically after generation
+    auto_added: bool = False
 
-
-# ── Path helpers ────────────────────────────────────────────────────
 
 def app_data_dir() -> Path:
     root = os.environ.get("APPDATA")
@@ -101,8 +103,6 @@ def config_path() -> Path:
 def history_path() -> Path:
     return output_dir() / "history.json"
 
-
-# ── MiniMax helpers ─────────────────────────────────────────────────
 
 def normalize_text(value: str) -> str:
     return value.replace("\\n", "\n")
@@ -166,8 +166,6 @@ def download(url: str) -> bytes:
         return response.read()
 
 
-# ── OS helpers ──────────────────────────────────────────────────────
-
 def open_path(path: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(str(path))  # type: ignore[attr-defined]
@@ -184,27 +182,18 @@ def reveal_file(path: Path) -> None:
         open_path(path.parent)
 
 
-# ── FFmpeg helpers ──────────────────────────────────────────────────
-
 def _ffmpeg_try_paths() -> Optional[str]:
-    """Try to locate ffmpeg on the system."""
     candidates = []
-
-    # 1. Bundled by PyInstaller (sys._MEIPASS is the temp extract dir)
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", "")
         if meipass:
-            bundled = os.path.join(meipass, "ffmpeg.exe")
-            candidates.append(bundled)
+            candidates.append(os.path.join(meipass, "ffmpeg.exe"))
 
-    # 2. Adjacent to the script / exe
     try:
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     except Exception:
         script_dir = os.getcwd()
     candidates.append(os.path.join(script_dir, "ffmpeg.exe"))
-
-    # 3. On PATH
     candidates.append("ffmpeg")
 
     if sys.platform.startswith("win"):
@@ -218,7 +207,8 @@ def _ffmpeg_try_paths() -> Optional[str]:
         try:
             result = subprocess.run(
                 [candidate, "-version"],
-                capture_output=True, timeout=10,
+                capture_output=True,
+                timeout=10,
                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.startswith("win") else {}),
             )
             if result.returncode == 0:
@@ -229,12 +219,12 @@ def _ffmpeg_try_paths() -> Optional[str]:
 
 
 def find_ffmpeg(configured: str = "") -> Optional[str]:
-    """Return the best ffmpeg path: configured > auto-detect > None."""
     if configured:
         try:
             result = subprocess.run(
                 [configured, "-version"],
-                capture_output=True, timeout=10,
+                capture_output=True,
+                timeout=10,
                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.startswith("win") else {}),
             )
             if result.returncode == 0:
@@ -244,17 +234,15 @@ def find_ffmpeg(configured: str = "") -> Optional[str]:
     return _ffmpeg_try_paths()
 
 
-# ── Application ─────────────────────────────────────────────────────
-
 class App(Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1180x820")
-        self.minsize(1000, 700)
+        self.geometry("1240x860")
+        self.minsize(1080, 760)
 
-        # -- Music‑generation state --
         self.history: list[HistoryItem] = []
+        self.filtered_history_ids: list[str] = []
         self.selected_history: Optional[HistoryItem] = None
         self.last_file: Optional[Path] = None
         self.last_remote_url = ""
@@ -274,9 +262,18 @@ class App(Tk):
         self.random_seed = BooleanVar(value=True)
         self.manual_seed = StringVar(value="")
         self.reference_audio_url = StringVar(value="")
+        self.batch_count = IntVar(value=1)
+        self.auto_play_after_generation = BooleanVar(value=False)
+        self.category_input = StringVar(value="")
         self.status = StringVar(value="准备就绪")
+        self.batch_status = StringVar(value="单首生成模式")
 
-        # -- Transcode state --
+        self.history_search = StringVar(value="")
+        self.history_category_filter = StringVar(value="全部分类")
+        self.history_favorites_only = BooleanVar(value=False)
+
+        self.category_library: list[str] = []
+
         self.transcode_items: list[TranscodeItem] = []
         self.tc_bitrate = IntVar(value=DEFAULT_TRANSCODE_BITRATE)
         self.tc_sample_rate = IntVar(value=DEFAULT_TRANSCODE_SAMPLE_RATE)
@@ -288,35 +285,44 @@ class App(Tk):
         self.load_config()
         self.load_history()
         self.build_ui()
-        self.refresh_history()
+        self.refresh_all_history_views()
+        self.refresh_result()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ═══════════════════════════════════════════════════════════════
-    #  UI shell  +  module switching
-    # ═══════════════════════════════════════════════════════════════
-
     def build_ui(self) -> None:
-        root = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        root = ttk.Frame(self, padding=(0, 0, 0, 0))
         root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
 
-        nav = ttk.Frame(root, padding=10)
-        self.module_host = ttk.Frame(root)
-        root.add(nav, weight=0)
-        root.add(self.module_host, weight=1)
+        shell = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+        shell.grid(row=0, column=0, sticky="nsew")
+
+        nav = ttk.Frame(shell, padding=10)
+        self.module_host = ttk.Frame(shell)
+        shell.add(nav, weight=0)
+        shell.add(self.module_host, weight=1)
 
         self.build_module_nav(nav)
         self._build_active_module("music_generation")
 
+        footer = ttk.Frame(root, padding=(12, 8))
+        footer.grid(row=1, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        ttk.Separator(footer, orient=tk.HORIZONTAL).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.footer_info = StringVar(value="播放器将在后续版本升级为内置控制器；当前使用系统默认播放器打开音频。")
+        ttk.Label(footer, textvariable=self.footer_info, foreground="#666666").grid(row=1, column=0, sticky="w")
+        ttk.Button(footer, text="播放当前歌曲", command=self.play_file).grid(row=1, column=1, sticky="e")
+
     def build_module_nav(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        ttk.Label(parent, text="工具", font=("Segoe UI", 14, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(0, 10)
-        )
+        ttk.Label(parent, text="工具", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
-        self.module_tree = ttk.Treeview(parent, show="tree", selectmode="browse", height=8)
+        self.module_tree = ttk.Treeview(parent, show="tree", selectmode="browse", height=10)
         self.module_tree.grid(row=1, column=0, sticky="nsew")
         self.module_tree.insert("", tk.END, iid="music_generation", text="音乐生成", open=True)
         self.module_tree.insert("", tk.END, iid="audio_transcode", text="音频转码", open=True)
+        self.module_tree.insert("", tk.END, iid="history", text="历史记录", open=True)
         self.module_tree.selection_set("music_generation")
         self.module_tree.bind("<<TreeviewSelect>>", self.on_module_select)
 
@@ -336,6 +342,7 @@ class App(Tk):
         subtitles = {
             "music_generation": "MiniMax /v1/music_generation",
             "audio_transcode": "音频格式与码率转换",
+            "history": "历史、收藏与分类管理",
         }
         self.module_subtitle.configure(text=subtitles.get(module_id, ""))
 
@@ -346,10 +353,8 @@ class App(Tk):
             self.build_music_generation_module(self.module_host)
         elif module_id == "audio_transcode":
             self.build_transcode_module(self.module_host)
-
-    # ═══════════════════════════════════════════════════════════════
-    #  Music‑generation module  (unchanged from original)
-    # ═══════════════════════════════════════════════════════════════
+        elif module_id == "history":
+            self.build_history_module(self.module_host)
 
     def build_music_generation_module(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -402,9 +407,41 @@ class App(Tk):
         ttk.Checkbutton(options, text="歌词优化", variable=self.lyrics_optimizer).pack(anchor="w")
         ttk.Checkbutton(options, text="纯音乐", variable=self.instrumental).pack(anchor="w")
         ttk.Checkbutton(options, text="添加 AI 水印", variable=self.aigc_watermark).pack(anchor="w")
+        ttk.Checkbutton(
+            options,
+            text="生成后自动播放（批量生成时自动禁用）",
+            variable=self.auto_play_after_generation,
+        ).pack(anchor="w", pady=(6, 0))
+
+        batch_box = ttk.LabelFrame(parent, text="批量生成", padding=10)
+        batch_box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        batch_box.columnconfigure(1, weight=1)
+        ttk.Label(batch_box, text="本次生成数量").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Spinbox(batch_box, from_=1, to=MAX_BATCH_COUNT, textvariable=self.batch_count, width=8).grid(
+            row=0, column=1, sticky="w"
+        )
+        ttk.Label(
+            batch_box,
+            text="Windows 端按顺序逐首提交，方便稳定记录进度与结果。",
+            foreground="#666666",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(batch_box, textvariable=self.batch_status, foreground="#1f5f9f").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        category_box = ttk.LabelFrame(parent, text="分类", padding=10)
+        category_box.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        category_box.columnconfigure(0, weight=1)
+        self.category_combo = ttk.Combobox(category_box, textvariable=self.category_input, values=self.category_library)
+        self.category_combo.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            category_box,
+            text="可选择已有分类，也可以直接输入新分类，生成后会自动保留到历史中。",
+            foreground="#666666",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         seed = ttk.LabelFrame(parent, text="Seed", padding=10)
-        seed.grid(row=4, column=0, sticky="ew")
+        seed.grid(row=6, column=0, sticky="ew")
         seed.columnconfigure(0, weight=1)
         ttk.Checkbutton(seed, text="每次随机", variable=self.random_seed).grid(row=0, column=0, sticky="w")
         ttk.Entry(seed, textvariable=self.manual_seed).grid(row=1, column=0, sticky="ew", pady=(6, 4))
@@ -443,46 +480,9 @@ class App(Tk):
         ttk.Button(actions, text="复制文件", command=self.copy_current_file).grid(row=0, column=4, padx=(0, 8))
         ttk.Label(actions, textvariable=self.status).grid(row=0, column=5, sticky="e")
 
-        self.result_text = tk.Text(parent, height=4, wrap="word")
+        self.result_text = tk.Text(parent, height=8, wrap="word")
         self.result_text.grid(row=7, column=0, sticky="ew", pady=(0, 10))
         self.result_text.configure(state="disabled")
-
-        history_box = ttk.LabelFrame(parent, text="历史记录", padding=8)
-        history_box.grid(row=8, column=0, sticky="nsew")
-        history_box.columnconfigure(0, weight=1)
-        history_box.columnconfigure(1, weight=2)
-        history_box.rowconfigure(0, weight=1)
-
-        self.history_tree = ttk.Treeview(
-            history_box,
-            columns=("time", "seed", "model", "file"),
-            show="headings",
-            height=8,
-        )
-        for column, title, width in [
-            ("time", "时间", 135),
-            ("seed", "Seed", 80),
-            ("model", "模型", 130),
-            ("file", "文件", 260),
-        ]:
-            self.history_tree.heading(column, text=title)
-            self.history_tree.column(column, width=width, anchor="w")
-        self.history_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.history_tree.bind("<<TreeviewSelect>>", self.on_history_select)
-
-        detail_frame = ttk.Frame(history_box)
-        detail_frame.grid(row=0, column=1, sticky="nsew")
-        detail_frame.columnconfigure(0, weight=1)
-        self.history_detail = tk.Text(detail_frame, height=8, wrap="word")
-        self.history_detail.grid(row=0, column=0, sticky="nsew")
-        detail_actions = ttk.Frame(detail_frame)
-        detail_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(detail_actions, text="加载参数", command=self.load_selected_history_parameters).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(detail_actions, text="清空历史", command=self.clear_history).pack(side=tk.LEFT)
-
-    # ═══════════════════════════════════════════════════════════════
-    #  Audio‑transcode module
-    # ═══════════════════════════════════════════════════════════════
 
     def build_transcode_module(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -502,36 +502,27 @@ class App(Tk):
     def _build_transcode_settings(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
 
-        # ── Transcode parameters ──
         params = ttk.LabelFrame(parent, text="转码参数", padding=10)
         params.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         params.columnconfigure(1, weight=1)
-
         self.combo(params, "比特率 (KBps)", self.tc_bitrate, TRANSCODE_BITRATES, 0)
         self.combo(params, "采样率 (Hz)", self.tc_sample_rate, TRANSCODE_SAMPLE_RATES, 1)
         self.combo(params, "输出格式", self.tc_format, TRANSCODE_FORMATS, 2)
 
-        # ── Output directory ──
         out_box = ttk.LabelFrame(parent, text="输出目录", padding=10)
         out_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         out_box.columnconfigure(0, weight=1)
         ttk.Entry(out_box, textvariable=self.tc_output_dir).grid(row=0, column=0, sticky="ew")
-        ttk.Button(out_box, text="浏览", command=self._transcode_browse_output).grid(
-            row=0, column=1, padx=(6, 0)
-        )
+        ttk.Button(out_box, text="浏览", command=self._transcode_browse_output).grid(row=0, column=1, padx=(6, 0))
 
-        # ── FFmpeg ──
         ffmpeg_box = ttk.LabelFrame(parent, text="FFmpeg", padding=10)
         ffmpeg_box.grid(row=2, column=0, sticky="ew")
         ffmpeg_box.columnconfigure(0, weight=1)
-
         detected = find_ffmpeg()
-        if detected:
+        if detected and not self.tc_ffmpeg_path.get():
             self.tc_ffmpeg_path.set(detected)
         ttk.Entry(ffmpeg_box, textvariable=self.tc_ffmpeg_path).grid(row=0, column=0, sticky="ew")
-        ttk.Button(ffmpeg_box, text="检测", command=self._transcode_detect_ffmpeg).grid(
-            row=0, column=1, padx=(6, 0)
-        )
+        ttk.Button(ffmpeg_box, text="检测", command=self._transcode_detect_ffmpeg).grid(row=0, column=1, padx=(6, 0))
         ttk.Label(
             ffmpeg_box,
             text="需要系统已安装 FFmpeg\n下载：https://ffmpeg.org/download.html",
@@ -548,7 +539,6 @@ class App(Tk):
             text="生成完的音乐会自动加入列表；也可手动添加文件或整个文件夹。",
         ).grid(row=1, column=0, sticky="w", pady=(0, 10))
 
-        # ── File list ──
         self.transcode_tree = ttk.Treeview(
             parent,
             columns=("source", "info", "target", "status"),
@@ -556,109 +546,230 @@ class App(Tk):
             height=12,
         )
         for col, title, width in [
-            ("source", "源文件", 220),
+            ("source", "源文件", 260),
             ("info", "原始信息", 140),
-            ("target", "目标参数", 160),
-            ("status", "状态", 110),
+            ("target", "目标参数", 190),
+            ("status", "状态", 120),
         ]:
             self.transcode_tree.heading(col, text=title)
             self.transcode_tree.column(col, width=width, anchor="w")
         self.transcode_tree.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
 
-        # ── Action bar ──
         actions = ttk.Frame(parent)
         actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        actions.columnconfigure(6, weight=1)
-
-        ttk.Button(actions, text="添加文件", command=self._transcode_add_files).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        ttk.Button(actions, text="添加文件夹", command=self._transcode_add_folder).grid(
-            row=0, column=1, padx=(0, 6)
-        )
-        ttk.Button(actions, text="移除选中", command=self._transcode_remove_selected).grid(
-            row=0, column=2, padx=(0, 6)
-        )
-        ttk.Button(actions, text="清空列表", command=self._transcode_clear_list).grid(
-            row=0, column=3, padx=(0, 6)
-        )
-        ttk.Button(actions, text="开始转码", command=self._transcode_start).grid(
-            row=0, column=4, padx=(0, 6)
-        )
-        ttk.Button(actions, text="打开输出目录", command=self._transcode_open_output).grid(
-            row=0, column=5, padx=(0, 6)
-        )
-        ttk.Label(actions, textvariable=self.tc_status).grid(row=0, column=6, sticky="e")
+        actions.columnconfigure(7, weight=1)
+        ttk.Button(actions, text="添加文件", command=self._transcode_add_files).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(actions, text="添加文件夹", command=self._transcode_add_folder).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(actions, text="从历史加入", command=self._transcode_add_selected_history).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(actions, text="移除选中", command=self._transcode_remove_selected).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(actions, text="清空列表", command=self._transcode_clear_list).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(actions, text="开始转码", command=self._transcode_start).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(actions, text="打开输出目录", command=self._transcode_open_output).grid(row=0, column=6, padx=(0, 6))
+        ttk.Label(actions, textvariable=self.tc_status).grid(row=0, column=7, sticky="e")
 
         self._refresh_transcode_tree()
 
-    # ── Transcode UI helpers ──────────────────────────────────────
+    def build_history_module(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(parent, padding=12)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(5, weight=1)
+        ttk.Label(header, text="历史记录", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="搜索").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        search_entry = ttk.Entry(header, textvariable=self.history_search)
+        search_entry.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+        search_entry.bind("<KeyRelease>", lambda _e: self.refresh_all_history_views())
+
+        ttk.Label(header, text="分类").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.history_category_combo = ttk.Combobox(
+            header,
+            textvariable=self.history_category_filter,
+            values=self.history_filter_values(),
+            state="readonly",
+            width=16,
+        )
+        self.history_category_combo.grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.history_category_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_all_history_views())
+        ttk.Checkbutton(
+            header,
+            text="仅看收藏",
+            variable=self.history_favorites_only,
+            command=self.refresh_all_history_views,
+        ).grid(row=1, column=4, sticky="w", pady=(8, 0))
+        ttk.Button(header, text="清空历史", command=self.clear_history).grid(row=1, column=5, sticky="e", pady=(8, 0))
+
+        body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=1)
+
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self.history_tree = ttk.Treeview(
+            left,
+            columns=("fav", "time", "category", "seed", "file"),
+            show="headings",
+            height=16,
+        )
+        for column, title, width in [
+            ("fav", "收藏", 55),
+            ("time", "时间", 135),
+            ("category", "分类", 120),
+            ("seed", "Seed", 80),
+            ("file", "文件", 280),
+        ]:
+            self.history_tree.heading(column, text=title)
+            self.history_tree.column(column, width=width, anchor="w")
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        self.history_tree.bind("<<TreeviewSelect>>", self.on_history_select)
+
+        self.history_detail = tk.Text(right, height=18, wrap="word")
+        self.history_detail.grid(row=0, column=0, sticky="nsew")
+
+        actions = ttk.Frame(right)
+        actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for index in range(3):
+            actions.columnconfigure(index, weight=1)
+        ttk.Button(actions, text="加载参数", command=self.load_selected_history_parameters).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        ttk.Button(actions, text="播放文件", command=self.play_selected_history).grid(row=0, column=1, padx=(0, 6), sticky="ew")
+        ttk.Button(actions, text="加入转码", command=self._transcode_add_selected_history).grid(row=0, column=2, sticky="ew")
+        ttk.Button(actions, text="收藏/取消收藏", command=self.toggle_selected_history_favorite).grid(row=1, column=0, padx=(0, 6), pady=(8, 0), sticky="ew")
+        ttk.Button(actions, text="修改分类", command=self.prompt_update_selected_history_category).grid(row=1, column=1, padx=(0, 6), pady=(8, 0), sticky="ew")
+        ttk.Button(actions, text="定位文件", command=self.reveal_selected_history_file).grid(row=1, column=2, pady=(8, 0), sticky="ew")
+
+        self.refresh_all_history_views()
+
+    def history_filter_values(self) -> list[str]:
+        values = ["全部分类"]
+        values.extend(self.category_library)
+        return values
+
+    def ensure_category(self, category: str) -> str:
+        normalized = category.strip()
+        if not normalized:
+            return ""
+        if normalized not in self.category_library:
+            self.category_library.append(normalized)
+            self.category_library.sort(key=str.lower)
+        return normalized
+
+    def sync_category_controls(self) -> None:
+        values = self.category_library
+        if hasattr(self, "category_combo"):
+            self.category_combo.configure(values=values)
+        if hasattr(self, "history_category_combo"):
+            self.history_category_combo.configure(values=self.history_filter_values())
+            if self.history_category_filter.get() not in self.history_filter_values():
+                self.history_category_filter.set("全部分类")
+
+    def refresh_all_history_views(self) -> None:
+        self.sync_category_controls()
+        self.refresh_history()
+        self.refresh_history_detail()
+        self.refresh_result()
+
+    def filtered_history(self) -> list[HistoryItem]:
+        keyword = self.history_search.get().strip().lower()
+        category = self.history_category_filter.get().strip()
+        favorites_only = self.history_favorites_only.get()
+
+        rows: list[HistoryItem] = []
+        for item in self.history:
+            if favorites_only and not item.is_favorite:
+                continue
+            if category and category != "全部分类" and item.category != category:
+                continue
+            if keyword:
+                haystack = " ".join(
+                    [
+                        item.created_at,
+                        item.prompt,
+                        item.lyrics,
+                        item.model,
+                        item.category,
+                        Path(item.file_path).name,
+                    ]
+                ).lower()
+                if keyword not in haystack:
+                    continue
+            rows.append(item)
+        return rows
 
     def _refresh_transcode_tree(self) -> None:
+        if not hasattr(self, "transcode_tree"):
+            return
         tree = self.transcode_tree
         tree.delete(*tree.get_children())
         for item in self.transcode_items:
             src = Path(item.source_path)
-            original_info = ""
-            if src.suffix.lower() in (".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"):
-                original_info = src.suffix.upper().lstrip(".")
+            original_info = src.suffix.upper().lstrip(".") if src.suffix else ""
             bitrate_k = item.target_bitrate // 1000
             sample_k = item.target_sample_rate / 1000
             target_desc = f"{bitrate_k}KBps / {sample_k:.1f}KHz / {item.target_format.upper()}"
-            tag = "[自动] " if item.auto_added else ""
-            tree.insert(
-                "", tk.END, iid=item.id,
-                values=(tag + item.source_filename, original_info, target_desc, item.status),
-            )
+            prefix = "[自动] " if item.auto_added else ""
+            tree.insert("", tk.END, iid=item.id, values=(prefix + item.source_filename, original_info, target_desc, item.status))
 
     def _transcode_add_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title="选择音频文件",
-            filetypes=[
-                ("音频文件", "*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.wma"),
-                ("所有文件", "*.*"),
-            ],
+            filetypes=[("音频文件", "*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.wma"), ("所有文件", "*.*")],
         )
-        for p in paths:
-            self._add_transcode_item(Path(p), auto=False)
+        for path in paths:
+            self._add_transcode_item(Path(path), auto=False)
 
     def _transcode_add_folder(self) -> None:
         folder = filedialog.askdirectory(title="选择文件夹")
         if not folder:
             return
         extensions = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma"}
-        for p in Path(folder).iterdir():
-            if p.is_file() and p.suffix.lower() in extensions:
-                self._add_transcode_item(p, auto=False)
+        for path in Path(folder).iterdir():
+            if path.is_file() and path.suffix.lower() in extensions:
+                self._add_transcode_item(path, auto=False)
+
+    def _transcode_add_selected_history(self) -> None:
+        item = self.selected_history
+        if not item:
+            self.tc_status.set("请先在历史记录中选中一首歌")
+            return
+        self._add_transcode_item(Path(item.file_path), auto=False)
 
     def _add_transcode_item(self, source: Path, auto: bool = False) -> None:
         if not source.exists():
             return
-        # Avoid exact duplicates
         for existing in self.transcode_items:
             if Path(existing.source_path) == source:
+                if auto:
+                    self.tc_status.set(f"已在转码列表中：{source.name}")
                 return
-        bitrate = self.tc_bitrate.get() * 1000
         item = TranscodeItem(
             id=str(uuid.uuid4()),
             source_path=str(source),
             source_filename=source.name,
-            target_bitrate=bitrate,
+            target_bitrate=self.tc_bitrate.get() * 1000,
             target_sample_rate=self.tc_sample_rate.get(),
             target_format=self.tc_format.get(),
             auto_added=auto,
         )
         self.transcode_items.append(item)
         self._refresh_transcode_tree()
-        if auto:
-            self.tc_status.set(f"已自动添加：{source.name}")
+        self.tc_status.set(f"{'已自动添加' if auto else '已添加'}：{source.name}")
 
     def _transcode_remove_selected(self) -> None:
+        if not hasattr(self, "transcode_tree"):
+            return
         selected = self.transcode_tree.selection()
         if not selected:
             return
         ids = set(selected)
-        self.transcode_items = [it for it in self.transcode_items if it.id not in ids]
+        self.transcode_items = [item for item in self.transcode_items if item.id not in ids]
         self._refresh_transcode_tree()
 
     def _transcode_clear_list(self) -> None:
@@ -690,8 +801,6 @@ class App(Tk):
         out.mkdir(parents=True, exist_ok=True)
         open_path(out)
 
-    # ── Transcode worker ──────────────────────────────────────────
-
     def _transcode_start(self) -> None:
         ffmpeg = find_ffmpeg(self.tc_ffmpeg_path.get().strip())
         if not ffmpeg:
@@ -699,24 +808,23 @@ class App(Tk):
             return
         self.tc_ffmpeg_path.set(ffmpeg)
 
-        pending = [it for it in self.transcode_items if it.status in ("等待转码", "失败")]
+        pending = [item for item in self.transcode_items if item.status in ("等待转码", "失败")]
         if not pending:
             self.tc_status.set("没有需要转码的文件")
             return
 
-        self.tc_status.set("正在转码…")
+        self.tc_status.set(f"准备转码 {len(pending)} 个文件")
         thread = threading.Thread(target=self._transcode_worker, args=(pending, ffmpeg), daemon=True)
         thread.start()
 
-    def _transcode_worker(self, items: list, ffmpeg: str) -> None:
+    def _transcode_worker(self, items: list[TranscodeItem], ffmpeg: str) -> None:
         out_dir = Path(self.tc_output_dir.get())
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        for item in items:
+        for index, item in enumerate(items, start=1):
             item.status = "转码中…"
             self.after(0, self._refresh_transcode_tree)
-            self.after(0, lambda m=f"转码中：{item.source_filename}": self.tc_status.set(m))
-
+            self.after(0, lambda m=f"转码中 {index}/{len(items)}：{item.source_filename}": self.tc_status.set(m))
             try:
                 src = Path(item.source_path)
                 stem = src.stem
@@ -725,13 +833,7 @@ class App(Tk):
                 fmt = item.target_format
                 out_name = f"{stem}_{bitrate_k}kbps_{sample_rate}hz.{fmt}"
                 out_path = out_dir / out_name
-
-                # Build ffmpeg command
-                cmd = [
-                    ffmpeg, "-y",
-                    "-i", str(src),
-                    "-ar", str(sample_rate),
-                ]
+                cmd = [ffmpeg, "-y", "-i", str(src), "-ar", str(sample_rate)]
                 if fmt == "wav":
                     cmd += ["-acodec", "pcm_s16le"]
                 elif fmt == "flac":
@@ -740,15 +842,15 @@ class App(Tk):
                     cmd += ["-b:a", f"{bitrate_k}k"]
                 cmd.append(str(out_path))
 
-                creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
                 result = subprocess.run(
                     cmd,
-                    capture_output=True, text=True, timeout=300,
-                    creationflags=creationflags,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
                 )
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or f"exit code {result.returncode}")
-
                 item.output_path = str(out_path)
                 item.status = "已完成"
             except Exception as exc:
@@ -756,12 +858,7 @@ class App(Tk):
                 item.error_message = str(exc)
             finally:
                 self.after(0, self._refresh_transcode_tree)
-
         self.after(0, lambda: self.tc_status.set("转码完成"))
-
-    # ═══════════════════════════════════════════════════════════════
-    #  Config persistence
-    # ═══════════════════════════════════════════════════════════════
 
     def load_config(self) -> None:
         try:
@@ -781,7 +878,10 @@ class App(Tk):
         self.random_seed.set(data.get("random_seed", self.random_seed.get()))
         self.manual_seed.set(data.get("manual_seed", self.manual_seed.get()))
         self.reference_audio_url.set(data.get("reference_audio_url", self.reference_audio_url.get()))
-        # Transcode settings
+        self.batch_count.set(int(data.get("batch_count", self.batch_count.get())))
+        self.auto_play_after_generation.set(bool(data.get("auto_play_after_generation", self.auto_play_after_generation.get())))
+        self.category_input.set(data.get("category_input", self.category_input.get()))
+        self.category_library = list(dict.fromkeys(data.get("category_library", [])))
         self.tc_bitrate.set(data.get("tc_bitrate", self.tc_bitrate.get()))
         self.tc_sample_rate.set(data.get("tc_sample_rate", self.tc_sample_rate.get()))
         self.tc_format.set(data.get("tc_format", self.tc_format.get()))
@@ -803,6 +903,10 @@ class App(Tk):
             "random_seed": self.random_seed.get(),
             "manual_seed": self.manual_seed.get(),
             "reference_audio_url": self.reference_audio_url.get(),
+            "batch_count": self.batch_count.get(),
+            "auto_play_after_generation": self.auto_play_after_generation.get(),
+            "category_input": self.category_input.get(),
+            "category_library": self.category_library,
             "tc_bitrate": self.tc_bitrate.get(),
             "tc_sample_rate": self.tc_sample_rate.get(),
             "tc_format": self.tc_format.get(),
@@ -811,27 +915,30 @@ class App(Tk):
         }
         config_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ═══════════════════════════════════════════════════════════════
-    #  History persistence
-    # ═══════════════════════════════════════════════════════════════
-
     def load_history(self) -> None:
         try:
             rows = json.loads(history_path().read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             self.history = []
             return
-        self.history = [HistoryItem(**row) for row in rows]
+
+        self.history = []
+        for row in rows:
+            row.setdefault("is_favorite", False)
+            row.setdefault("category", "")
+            row.setdefault("batch_id", "")
+            row.setdefault("batch_index", 1)
+            row.setdefault("batch_total", 1)
+            item = HistoryItem(**row)
+            self.history.append(item)
+            if item.category:
+                self.ensure_category(item.category)
 
     def save_history(self) -> None:
         history_path().write_text(
             json.dumps([asdict(item) for item in self.history], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
-    # ═══════════════════════════════════════════════════════════════
-    #  Music‑generation logic
-    # ═══════════════════════════════════════════════════════════════
 
     def make_seed(self) -> int:
         if self.random_seed.get():
@@ -874,32 +981,70 @@ class App(Tk):
         return payload, prompt, submitted_lyrics
 
     def generate(self) -> None:
+        count = max(1, min(MAX_BATCH_COUNT, int(self.batch_count.get())))
+        self.batch_count.set(count)
+        if count > 1 and self.auto_play_after_generation.get():
+            self.auto_play_after_generation.set(False)
+            self.footer_info.set("批量生成时已自动关闭“生成后自动播放”，避免打断当前工作。")
         self.save_config()
         thread = threading.Thread(target=self.generate_worker, daemon=True)
         thread.start()
 
     def generate_worker(self) -> None:
         try:
-            seed = self.make_seed()
-            payload, prompt, lyrics = self.collect_payload(seed)
-            self.set_status(f"正在提交到 MiniMax... Seed: {seed}")
-            endpoint = self.base_url.get().strip().rstrip("/") + "/v1/music_generation"
-            response = http_json(endpoint, self.api_key.get().strip(), payload)
-            audio_data, remote_url = extract_audio(response)
-            self.set_status("正在保存音频...")
-            if audio_data is None:
-                audio_data = download(remote_url)
-            filename = f"minimax-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{self.audio_format.get()}"
-            file_path = output_dir() / filename
-            file_path.write_bytes(audio_data)
-            item = self.append_history(file_path, remote_url, seed, prompt, lyrics)
-            self.after(0, lambda: self.apply_generated_result(item))
-            # ── Auto‑add to transcode list ──
-            self.after(0, lambda: self._add_transcode_item(file_path, auto=True))
+            batch_total = max(1, min(MAX_BATCH_COUNT, int(self.batch_count.get())))
+            category = self.ensure_category(self.category_input.get())
+            self.after(0, self.sync_category_controls)
+            batch_id = str(uuid.uuid4()) if batch_total > 1 else ""
+            self.set_batch_status(f"准备生成 {batch_total} 首歌曲")
+
+            for index in range(1, batch_total + 1):
+                seed = self.make_seed()
+                payload, prompt, lyrics = self.collect_payload(seed)
+                self.set_status(f"正在提交到 MiniMax... {index}/{batch_total}，Seed: {seed}")
+                self.set_batch_status(f"生成中 {index}/{batch_total}")
+                endpoint = self.base_url.get().strip().rstrip("/") + "/v1/music_generation"
+                response = http_json(endpoint, self.api_key.get().strip(), payload)
+                audio_data, remote_url = extract_audio(response)
+                self.set_status(f"正在保存音频... {index}/{batch_total}")
+                if audio_data is None:
+                    audio_data = download(remote_url)
+
+                suffix = f"_{index:02d}" if batch_total > 1 else ""
+                filename = f"minimax-{datetime.now().strftime('%Y%m%d-%H%M%S')}{suffix}.{self.audio_format.get()}"
+                file_path = output_dir() / filename
+                file_path.write_bytes(audio_data)
+
+                item = self.append_history(
+                    file_path=file_path,
+                    remote_url=remote_url,
+                    seed=seed,
+                    prompt=prompt,
+                    lyrics=lyrics,
+                    category=category,
+                    batch_id=batch_id,
+                    batch_index=index,
+                    batch_total=batch_total,
+                )
+                self.after(0, lambda row=item: self.apply_generated_result(row))
+                self.after(0, lambda path=file_path: self._add_transcode_item(path, auto=True))
+
+            self.set_batch_status(f"批量生成完成，共 {batch_total} 首")
         except Exception as exc:
             self.after(0, lambda: self.fail(str(exc)))
 
-    def append_history(self, file_path: Path, remote_url: str, seed: int, prompt: str, lyrics: str) -> HistoryItem:
+    def append_history(
+        self,
+        file_path: Path,
+        remote_url: str,
+        seed: int,
+        prompt: str,
+        lyrics: str,
+        category: str,
+        batch_id: str,
+        batch_index: int,
+        batch_total: int,
+    ) -> HistoryItem:
         item = HistoryItem(
             id=str(uuid.uuid4()),
             created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -919,6 +1064,10 @@ class App(Tk):
             directory_path=str(file_path.parent),
             file_path=str(file_path),
             remote_url=remote_url,
+            category=category,
+            batch_id=batch_id,
+            batch_index=batch_index,
+            batch_total=batch_total,
         )
         self.history.insert(0, item)
         self.save_history()
@@ -929,32 +1078,55 @@ class App(Tk):
         self.last_file = Path(item.file_path)
         self.last_remote_url = item.remote_url
         self.last_seed = item.seed
-        self.set_status(f"生成完成，Seed: {item.seed}")
-        self.refresh_result()
-        self.refresh_history()
+        self.set_status(f"生成完成：{Path(item.file_path).name}，Seed: {item.seed}")
+        self.footer_info.set(f"当前歌曲：{Path(item.file_path).name}")
+        self.refresh_all_history_views()
+        if self.auto_play_after_generation.get() and item.batch_total == 1:
+            self.play_file()
 
     def refresh_result(self) -> None:
+        if not hasattr(self, "result_text"):
+            return
         self.result_text.configure(state="normal")
         self.result_text.delete("1.0", tk.END)
         if self.last_file:
             self.result_text.insert(tk.END, f"文件：{self.last_file}\n")
         if self.last_seed is not None:
             self.result_text.insert(tk.END, f"Seed：{self.last_seed}\n")
+        if self.selected_history and self.selected_history.category:
+            self.result_text.insert(tk.END, f"分类：{self.selected_history.category}\n")
+        if self.selected_history and self.selected_history.batch_total > 1:
+            self.result_text.insert(
+                tk.END,
+                f"批量进度：第 {self.selected_history.batch_index} 首 / 共 {self.selected_history.batch_total} 首\n",
+            )
         if self.last_remote_url:
             self.result_text.insert(tk.END, f"临时链接：{self.last_remote_url}\n")
         self.result_text.configure(state="disabled")
 
     def refresh_history(self) -> None:
+        if not hasattr(self, "history_tree"):
+            return
         self.history_tree.delete(*self.history_tree.get_children())
-        for item in self.history:
+        visible_rows = self.filtered_history()
+        self.filtered_history_ids = [item.id for item in visible_rows]
+        for item in visible_rows:
+            favorite_mark = "★" if item.is_favorite else ""
+            file_name = Path(item.file_path).name
+            if item.batch_total > 1:
+                file_name = f"[{item.batch_index}/{item.batch_total}] {file_name}"
             self.history_tree.insert(
                 "",
                 tk.END,
                 iid=item.id,
-                values=(item.created_at, item.seed, item.model, Path(item.file_path).name),
+                values=(favorite_mark, item.created_at, item.category or "-", item.seed, file_name),
             )
+        if self.selected_history and self.selected_history.id in self.filtered_history_ids:
+            self.history_tree.selection_set(self.selected_history.id)
 
     def on_history_select(self, _event=None) -> None:
+        if not hasattr(self, "history_tree"):
+            return
         selected = self.history_tree.selection()
         if not selected:
             return
@@ -966,20 +1138,26 @@ class App(Tk):
         self.last_file = Path(item.file_path)
         self.last_remote_url = item.remote_url
         self.last_seed = item.seed
+        self.footer_info.set(f"当前歌曲：{Path(item.file_path).name}")
         self.refresh_result()
         self.refresh_history_detail()
 
     def refresh_history_detail(self) -> None:
+        if not hasattr(self, "history_detail"):
+            return
         self.history_detail.configure(state="normal")
         self.history_detail.delete("1.0", tk.END)
         item = self.selected_history
         if item:
             detail = (
                 f"时间：{item.created_at}\n"
+                f"收藏：{'是' if item.is_favorite else '否'}\n"
+                f"分类：{item.category or '-'}\n"
                 f"模型：{item.model}\n"
                 f"Seed：{item.seed}\n"
                 f"输出：{item.output_format} / {item.audio_format}\n"
                 f"音频：{item.sample_rate} Hz / {item.bitrate} bps\n"
+                f"批量：第 {item.batch_index} 首 / 共 {item.batch_total} 首\n"
                 f"选项：{'纯音乐' if item.instrumental else '含歌词'}，"
                 f"{'歌词优化' if item.lyrics_optimizer else '不优化歌词'}，"
                 f"{'AI 水印' if item.aigc_watermark else '无 AI 水印'}\n"
@@ -1007,10 +1185,16 @@ class App(Tk):
         self.random_seed.set(False)
         self.manual_seed.set(str(item.seed))
         self.reference_audio_url.set(item.reference_audio_url)
-        self.prompt_text.delete("1.0", tk.END)
-        self.prompt_text.insert(tk.END, item.prompt)
-        self.lyrics_text.delete("1.0", tk.END)
-        self.lyrics_text.insert(tk.END, item.lyrics)
+        self.category_input.set(item.category)
+        if hasattr(self, "prompt_text"):
+            self.prompt_text.delete("1.0", tk.END)
+            self.prompt_text.insert(tk.END, item.prompt)
+        if hasattr(self, "lyrics_text"):
+            self.lyrics_text.delete("1.0", tk.END)
+            self.lyrics_text.insert(tk.END, item.lyrics)
+        self.module_tree.selection_set("music_generation")
+        self.selected_module.set("music_generation")
+        self._build_active_module("music_generation")
         self.set_status(f"已加载历史参数，Seed: {item.seed}")
 
     def clear_history(self) -> None:
@@ -1021,20 +1205,73 @@ class App(Tk):
         self.history = []
         self.selected_history = None
         self.save_history()
-        self.refresh_history()
-        self.refresh_history_detail()
+        self.refresh_all_history_views()
         self.set_status("历史记录已清空")
 
-    # ═══════════════════════════════════════════════════════════════
-    #  Shared actions
-    # ═══════════════════════════════════════════════════════════════
+    def toggle_selected_history_favorite(self) -> None:
+        item = self.selected_history
+        if not item:
+            return
+        item.is_favorite = not item.is_favorite
+        self.save_history()
+        self.refresh_all_history_views()
+        self.set_status("已更新收藏状态")
+
+    def prompt_update_selected_history_category(self) -> None:
+        item = self.selected_history
+        if not item:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("修改分类")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("360x140")
+        dialog.columnconfigure(0, weight=1)
+
+        value = StringVar(value=item.category)
+        ttk.Label(dialog, text="输入新的分类名称").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        combo = ttk.Combobox(dialog, textvariable=value, values=self.category_library)
+        combo.grid(row=1, column=0, sticky="ew", padx=12)
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=2, column=0, sticky="e", padx=12, pady=12)
+
+        def submit() -> None:
+            item.category = self.ensure_category(value.get())
+            self.category_input.set(item.category)
+            self.save_history()
+            self.save_config()
+            self.refresh_all_history_views()
+            dialog.destroy()
+            self.set_status("已更新分类")
+
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="保存", command=submit).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def play_selected_history(self) -> None:
+        item = self.selected_history
+        if not item:
+            return
+        file_path = Path(item.file_path)
+        if file_path.exists():
+            self.last_file = file_path
+            self.footer_info.set(f"当前歌曲：{file_path.name}")
+            open_path(file_path)
+
+    def reveal_selected_history_file(self) -> None:
+        item = self.selected_history
+        if not item:
+            return
+        file_path = Path(item.file_path)
+        if file_path.exists():
+            reveal_file(file_path)
 
     def play_file(self) -> None:
         if self.last_file and self.last_file.exists():
             open_path(self.last_file)
 
     def open_folder(self) -> None:
-        if self.last_file:
+        if self.last_file and self.last_file.exists():
             open_path(self.last_file.parent)
 
     def reveal_current_file(self) -> None:
@@ -1063,10 +1300,14 @@ class App(Tk):
 
     def fail(self, message: str) -> None:
         self.set_status("生成失败")
+        self.set_batch_status("批量任务中断")
         messagebox.showerror("生成失败", message)
 
     def set_status(self, message: str) -> None:
         self.after(0, lambda: self.status.set(message))
+
+    def set_batch_status(self, message: str) -> None:
+        self.after(0, lambda: self.batch_status.set(message))
 
     def on_close(self) -> None:
         self.save_config()
