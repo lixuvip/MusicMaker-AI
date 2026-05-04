@@ -115,7 +115,7 @@ macos/build/MusicMaker-AI.app
 
 ```bash
 cd windows
-python musicmaker_ai_windows.py
+py musicmaker_ai_windows.py
 ```
 
 如果要打包为 exe，请在 Windows 环境运行：
@@ -143,7 +143,7 @@ windows/dist/MusicMaker-AI.exe
 ## 平台说明
 
 - macOS 版当前使用本机 `ffmpeg` 执行转码。
-- Windows 版支持自动检测 `ffmpeg`，也支持打包时把 `ffmpeg.exe` 一起带入 exe。
+- Windows 版打包脚本会自动探测 `py` / `python` / `python3`，并在需要时下载 `ffmpeg.exe` 一起带入 exe。
 - 两端功能尽量保持一致，但界面实现会分别遵循各自平台的技术栈。
 
 ## 子项目说明

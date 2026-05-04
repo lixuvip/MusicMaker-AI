@@ -2,15 +2,42 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-python --version >nul 2>nul
-if errorlevel 1 (
-  echo Python is required. Install Python 3.11+ from https://www.python.org/downloads/windows/
+set "PYTHON_CMD="
+for %%P in (py python python3) do (
+  where %%P >nul 2>nul
+  if not errorlevel 1 if not defined PYTHON_CMD set "PYTHON_CMD=%%P"
+)
+
+if not defined PYTHON_CMD (
+  echo Python launcher not found.
+  echo 请先安装 Python 3.11+： https://www.python.org/downloads/windows/
+  echo 安装时勾选 "Add python.exe to PATH"，或者确保系统里有 "py" 命令。
   pause
   exit /b 1
 )
 
-python -m pip install --upgrade pyinstaller
+echo Using Python launcher: %PYTHON_CMD%
+%PYTHON_CMD% --version
 if errorlevel 1 (
+  echo 无法通过 "%PYTHON_CMD%" 启动 Python。
+  echo 请检查 Python 是否安装完整，或者尝试重新打开命令行窗口后再运行。
+  pause
+  exit /b 1
+)
+
+where powershell >nul 2>nul
+if errorlevel 1 (
+  echo 当前系统没有可用的 PowerShell。
+  echo 这会影响 FFmpeg 的自动下载与解压。
+  echo 你可以先手动把 ffmpeg.exe 放到当前目录，再重新运行。
+  pause
+  exit /b 1
+)
+
+%PYTHON_CMD% -m pip install --upgrade pip pyinstaller
+if errorlevel 1 (
+  echo pip 或 PyInstaller 安装失败。
+  echo 请检查网络连接，或先手动执行 "%PYTHON_CMD% -m pip install --upgrade pip pyinstaller"。
   pause
   exit /b 1
 )
@@ -41,8 +68,9 @@ if not exist "%FFMPEG_EXE%" (
   if "!FFMPEG_OK!"=="0" (
     echo.
     echo ERROR: Failed to download FFmpeg from both sources.
-    echo Please manually download ffmpeg.exe from https://ffmpeg.org/download.html
-    echo and place it in: %cd%
+    echo 无法自动下载 FFmpeg。
+    echo 你可以手动从 https://ffmpeg.org/download.html 下载 ffmpeg.exe
+    echo 然后放到当前目录： %cd%
     pause
     exit /b 1
   )
@@ -52,6 +80,7 @@ if not exist "%FFMPEG_EXE%" (
     "Expand-Archive -Path '%TEMP%\ffmpeg.zip' -DestinationPath '%TEMP%\ffmpeg_extract' -Force"
   if errorlevel 1 (
     echo ERROR: Failed to extract FFmpeg archive.
+    echo FFmpeg 压缩包下载到了本地，但解压失败。
     pause
     exit /b 1
   )
@@ -64,7 +93,8 @@ if not exist "%FFMPEG_EXE%" (
   if exist "%TEMP%\ffmpeg_extract" rmdir /s /q "%TEMP%\ffmpeg_extract"
 
   if not exist "%FFMPEG_EXE%" (
-    echo ERROR: ffmpeg.exe not found after extraction. Place ffmpeg.exe in the project root manually.
+    echo ERROR: ffmpeg.exe not found after extraction.
+    echo 自动解压后未找到 ffmpeg.exe，请手动把 ffmpeg.exe 放到项目根目录再试。
     pause
     exit /b 1
   )
@@ -72,7 +102,7 @@ if not exist "%FFMPEG_EXE%" (
 )
 
 :: ── PyInstaller build ──────────────────────────────────────────
-python -m PyInstaller ^
+%PYTHON_CMD% -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --onefile ^

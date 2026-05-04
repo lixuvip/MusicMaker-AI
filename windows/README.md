@@ -2,12 +2,18 @@
 
 Windows 桌面版源码。使用 Python 标准库 + Tkinter 实现，运行功能不依赖第三方 Python 库；打包 `.exe` 时需要 PyInstaller。
 
-**音频转码功能依赖系统安装 [FFmpeg](https://ffmpeg.org/download.html)**（不装也能用音乐生成，只是转码不可用）。
+`build_windows.bat` 现在会自动探测 `py` / `python` / `python3`，并自动下载 `ffmpeg.exe` 后打包进最终 `.exe`。
 
 ## 直接运行
 
 ```bat
 cd /d "windows"
+py musicmaker_ai_windows.py
+```
+
+如果你的机器没有 `py`，也可以改用：
+
+```bat
 python musicmaker_ai_windows.py
 ```
 
@@ -25,7 +31,7 @@ build_windows.bat
 dist\MusicMaker-AI.exe
 ```
 
-> FFmpeg 为外部工具，不会打包进 exe。用户需自行安装并确保 `ffmpeg` 在 PATH 中，或在转码页面手动填写路径。
+如果系统里没有现成的 `ffmpeg.exe`，脚本会先自动下载并打包进去，所以生成的 `MusicMaker-AI.exe` 可以直接带转码能力运行。
 
 ## 功能
 
