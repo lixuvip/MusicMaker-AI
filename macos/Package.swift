@@ -13,7 +13,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MusicMakerAI",
-            path: "Sources/MusicMakerAI"
+            path: "Sources/MusicMakerAI",
+            resources: [
+                .copy("../../Support/VoxCPM")
+            ]
         )
     ]
 )

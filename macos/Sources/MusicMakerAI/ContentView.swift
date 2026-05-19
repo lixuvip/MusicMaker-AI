@@ -16,6 +16,8 @@ struct ContentView: View {
                     switch selectedModule ?? .musicGeneration {
                     case .musicGeneration:
                         MusicGenerationModule()
+                    case .voiceCloning:
+                        VoiceCloningModule()
                     case .audioTranscoding:
                         AudioTranscodingModule()
                     case .history:
@@ -41,6 +43,7 @@ struct ContentView: View {
 
 enum ToolModule: String, CaseIterable, Identifiable {
     case musicGeneration
+    case voiceCloning
     case audioTranscoding
     case history
 
@@ -50,6 +53,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
         switch self {
         case .musicGeneration:
             return "音乐生成"
+        case .voiceCloning:
+            return "声音克隆"
         case .audioTranscoding:
             return "音频转码"
         case .history:
@@ -61,6 +66,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
         switch self {
         case .musicGeneration:
             return "MiniMax /v1/music_generation"
+        case .voiceCloning:
+            return "VoxCPM 插件模块"
         case .audioTranscoding:
             return "本地 ffmpeg 转码队列"
         case .history:
@@ -72,6 +79,8 @@ enum ToolModule: String, CaseIterable, Identifiable {
         switch self {
         case .musicGeneration:
             return "music.quarternote.3"
+        case .voiceCloning:
+            return "waveform.and.mic"
         case .audioTranscoding:
             return "waveform.badge.magnifyingglass"
         case .history:

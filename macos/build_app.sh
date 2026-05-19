@@ -14,6 +14,8 @@ rm -rf "$APP_DIR"
 mkdir -p "$BINARY_DIR" "$RESOURCES_DIR"
 cp ".build/release/$APP_NAME" "$BINARY_DIR/$APP_NAME"
 cp "Assets/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+rm -rf "$RESOURCES_DIR/VoxCPM"
+cp -R "Support/VoxCPM" "$RESOURCES_DIR/VoxCPM"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

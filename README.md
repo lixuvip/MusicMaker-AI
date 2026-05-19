@@ -5,6 +5,10 @@ MusicMaker-AI 是一个面向创作流程的桌面工具，提供两项核心能
 - 使用 MiniMax Music Generation API 生成音乐
 - 对生成后的音频或本地音频进行转码处理
 
+当前 macOS 版本还在继续扩展第三类能力：
+
+- 以插件模块形式接入本地 VoxCPM，用于声音克隆与声音设计
+
 项目同时维护 macOS 与 Windows 两个桌面版本，目标是让两端在能力上尽量保持一致，同时保留各自平台更自然的交互方式。
 
 当前版本的音乐生成能力主要基于 MiniMax Music Generation API。也特别感谢 MiniMax 提供了现阶段稳定、易于接入的音乐生成模型能力，让 MusicMaker-AI 可以先把创作、试听、筛选与转码这套桌面工作流跑通。后续版本会在保持现有体验的基础上，逐步兼容更多模型与服务 API，给创作流程留出更大的选择空间。
@@ -39,6 +43,7 @@ MusicMaker-AI 是一个面向创作流程的桌面工具，提供两项核心能
 ## 功能概览
 
 - 音乐生成
+- 声音克隆插件模块
 - 音乐参数配置：模型、输出格式、音频格式、采样率、比特率
 - 歌词输入与纯音乐模式
 - Seed 随机或手动控制
@@ -53,6 +58,7 @@ MusicMaker-AI 是一个面向创作流程的桌面工具，提供两项核心能
 - 全局播放器、播放进度条、拖拽播放
 - macOS 空格键播放 / 暂停
 - 音频转码模块
+- macOS VoxCPM 插件设置、环境验证、快速克隆、声音设计、任务历史
 - 生成结果自动加入转码列表
 - 手动添加本地音频文件到转码列表
 - 自动检测 `ffmpeg`，并支持在 macOS 上一键安装
@@ -108,6 +114,17 @@ chmod +x build_app.sh
 ```text
 macos/build/MusicMaker-AI.app
 ```
+
+如果要使用 `声音克隆` 模块，还需要准备一个本地 VoxCPM checkout，并在 app 内配置：
+
+- VoxCPM 根目录
+- 可运行 VoxCPM 的 Python 命令
+
+当前插件式接入方式说明：
+
+- 以 MusicMaker-AI 原生 UI 展示，不嵌入 VoxCPM 原网页界面
+- 通过 Python bridge 调用本地 VoxCPM CLI
+- 不强依赖固定绝对路径，可按设备分别配置不同的 VoxCPM 目录
 
 ### Windows
 
